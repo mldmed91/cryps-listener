@@ -3,13 +3,11 @@ import os, requests
 
 app = Flask(__name__)
 
-# ===== Config (من الـ env على Render) =====
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 CHAT_ID = os.getenv("CHAT_ID", "")
 HEL_SECRET = os.getenv("HEL_WEBHOOK_SECRET", "")
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-# ===== Helpers =====
 def send_tg(text, chat_id=CHAT_ID):
     if not BOT_TOKEN or not chat_id:
         print("BOT_TOKEN or CHAT_ID missing")
@@ -21,7 +19,6 @@ def send_tg(text, chat_id=CHAT_ID):
     except Exception as e:
         print("Telegram send error:", e)
 
-# Solo admin only
 ALLOWED_ADMIN_IDS = {int(CHAT_ID)} if CHAT_ID else set()
 def is_admin(chat_id):
     try:
@@ -29,12 +26,10 @@ def is_admin(chat_id):
     except:
         return False
 
-# ===== Routes =====
 @app.route("/", methods=["GET"])
 def home():
     return "Cryps Listener on Render ✅"
 
-# Telegram webhook (باش البوت يجاوبك فـ الشات)
 @app.route("/tg-webhook", methods=["POST"])
 def tg_webhook():
     data = request.get_json(silent=True) or {}
@@ -54,7 +49,6 @@ def tg_webhook():
         send_tg(f"🤖 Got: {text}", chat_id)
     return jsonify({"ok": True})
 
-# Helius webhook (الأحداث من سولانا)
 @app.route("/hel-webhook", methods=["POST"])
 def hel_webhook():
     if HEL_SECRET and request.headers.get("X-Cryps-Secret") != HEL_SECRET:
