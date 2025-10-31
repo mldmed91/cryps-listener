@@ -62,3 +62,23 @@ def hel_webhook():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+
+@app.route('/hel-webhook', methods=['POST'])
+def hel_webhook():
+    data = request.get_json(force=True)
+    secret = request.headers.get('X-Cryps-Secret')
+    if secret != os.getenv('HEL_SECRET'):
+        return ('', 403)
+    
+    ev = (data.get('type') or data.get('eventType') or '').upper()
+    signature = data.get('signature') or ''
+    if ev in ('TOKEN_MINT','MINT','CREATE','TOKEN_CREATE'):
+        mint = data.get('mint') or data.get('tokenMint')
+        signer = (data.get('signer') or (data.get('accounts') or [None])[0])
+        program = data.get('programId')
+        if mint and signer:
+            msg = f"⚡ Mint jadid detecta!\n💎 Token: {mint}\n🧰 Maker: {signer}\n🧠 Program: {program}"
+            send_tg(msg)
+            return jsonify({'ok':True}), 200
+    return jsonify({'ok':False}), 200
+
