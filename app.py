@@ -1,118 +1,107 @@
-from flask import Flask, request, jsonify
-import os, requests, time, hmac, math
-
-app = Flask(__name__)
-
-# 🧠 Environment vars
-BOT = os.getenv("BOT_TOKEN")
-CHAT = os.getenv("CHAT_ID")
-HEL_SECRET = os.getenv("HEL_SECRET") or os.getenv("HEL_WEBHOOK_SECRET") or "cryps_secret_943k29"
-
-# ==========================
-# 🔧 Telegram Sender
-# ==========================
-def send_tg(text):
-    if not BOT or not CHAT: return
-    try:
-        requests.get(
-            f"https://api.telegram.org/bot{BOT}/sendMessage",
-            params={"chat_id": CHAT, "text": text, "parse_mode": "Markdown"},
-            timeout=5
-        )
-    except Exception as e:
-        app.logger.warning(f"[TG] send failed: {e}")
-
-# ==========================
-# 🤖 Cryps Ultra Core Logic
-# ==========================
-def cryps_score(tx):
-    sol_value = tx.get("nativeTransfers", [{}])[0].get("amount", 0) / 1e9
-    holders = len(tx.get("accounts", []))
-    is_mint = tx.get("type") == "TOKEN_MINT"
-
-    score = 0
-    if sol_value > 5: score += 4
-    if is_mint: score += 3
-    if holders > 10: score += 2
-    if tx.get("tokenTransfers"): score += 1
-
-    # Normalize to 0→10
-    return min(round(score, 1), 10)
-
-# ==========================
-# 🔗 Helius Webhook
-# ==========================
 @app.route("/hel-webhook", methods=["POST"])
 def hel_webhook():
-    # Secret check (3 modes)
+    expected = HEL_SECRET or ""
+    # مصادقة: X-Cryps-Secret أو Authorization: Bearer أو ?secret=
     got = request.headers.get("X-Cryps-Secret") or request.args.get("secret") or ""
-    if got != HEL_SECRET:
-        app.logger.warning(f"[HEL] SECRET MISMATCH: got='{got}' expected='{HEL_SECRET}'")
+    if not got:
+        auth = request.headers.get("Authorization", "")
+        if auth.lower().startswith("bearer "):
+            got = auth.split(" ", 1)[1].strip()
+    if got != expected:
+        app.logger.warning(f"[HEL] SECRET MISMATCH: got='{got}' expected='{expected}'")
         return ("unauthorized", 403)
 
-    evt = request.get_json(silent=True) or {}
-    txs = evt.get("transactions", [])
+    data = request.get_json(silent=True)
+    if data is None:
+        app.logger.warning("[HEL] No JSON body")
+        return jsonify(ok=True), 200
+
+    # ✅ جهّز txs مهما كان شكل البودي
+    if isinstance(data, list):
+        txs = data
+    elif isinstance(data, dict):
+        # Helius enhanced غالباً كيبعث 'transactions' أو 'events'
+        txs = data.get("transactions") or data.get("events") or []
+        # بعض الحالات كيبعث عنصر واحد مباشرة
+        if isinstance(txs, dict):
+            txs = [txs]
+    else:
+        txs = []
+
     if not txs:
         send_tg("⚙️ Test Webhook Received (no transactions)")
-        return jsonify(ok=True)
+        return jsonify(ok=True), 200
 
     for tx in txs:
-        sig = tx.get("signature", "")
-        sol_value = tx.get("nativeTransfers", [{}])[0].get("amount", 0) / 1e9
-        token = tx.get("tokenTransfers", [{}])[0].get("mint", "Unknown")
-        tx_type = tx.get("type", "UNKNOWN")
-        score = cryps_score(tx)
+        try:
+            # خدم ب .get غير إلا كان dict
+            tx = tx or {}
+            if not isinstance(tx, dict):
+                continue
 
-        # 🦈 Whale
-        if sol_value >= 5:
-            send_tg(f"🦈 *Whale Detected*\n💰 {sol_value:.2f} SOL\n🔗 [Solscan](https://solscan.io/tx/{sig})\n📊 CrypsScore: *{score}/10*")
+            sig = (
+                tx.get("signature")
+                or (tx.get("transaction") or {}).get("signature")
+                or "unknown"
+            )
 
-        # ⚡ New Mint
-        elif tx_type == "TOKEN_MINT":
-            send_tg(f"⚡ *New Token Minted*\n🪙 {token}\n🔗 [Solscan](https://solscan.io/token/{token})\n📊 CrypsScore: *{score}/10*")
+            # nativeTransfers: يقدر يكون list أو dict أو ماكينش
+            native = tx.get("nativeTransfers") or []
+            if isinstance(native, dict):
+                native = [native]
+            lamports = 0
+            if native and isinstance(native[0], dict):
+                lamports = native[0].get("amount", 0) or native[0].get("lamports", 0) or 0
+            sol_value = float(lamports) / 1e9
 
-        # 💡 Winner hint (auto-detect)
-        elif score >= 7:
-            send_tg(f"🚀 *Winner Candidate Found*\n🔗 [Solscan](https://solscan.io/tx/{sig})\n📊 CrypsScore: *{score}/10*")
+            # tokenTransfers نفس الشي
+            token_mint = "Unknown"
+            tts = tx.get("tokenTransfers") or []
+            if isinstance(tts, dict):
+                tts = [tts]
+            if tts and isinstance(tts[0], dict):
+                token_mint = tts[0].get("mint") or tts[0].get("tokenAddress") or "Unknown"
 
-    return jsonify(ok=True)
+            tx_type = (
+                tx.get("type")
+                or tx.get("activityType")
+                or (tx.get("events") or {}).get("type")
+                or "UNKNOWN"
+            )
 
-# ==========================
-# 💬 Telegram Commands
-# ==========================
-@app.route("/tg-webhook", methods=["POST"])
-def tg_webhook():
-    data = request.get_json(silent=True) or {}
-    msg = (data.get("message") or {}).get("text", "").strip().lower()
-    if not msg: return jsonify(ok=True)
+            # CrypsScore بسيط
+            score = 0
+            if sol_value > 5: score += 4
+            if tx_type == "TOKEN_MINT": score += 3
+            accs = tx.get("accounts") or []
+            if isinstance(accs, dict): accs = [accs]
+            if isinstance(accs, list) and len(accs) > 10: score += 2
+            if tts: score += 1
+            score = min(round(score, 1), 10)
 
-    if msg in ["/start", "start"]:
-        send_tg("✅ Cryps Ultra Pilot Online.\nCommands: /scan | /winners | /kinchi")
+            # Alerts
+            if sol_value >= 5:
+                send_tg(
+                    f"🦈 *Whale Detected*\n"
+                    f"💰 {sol_value:.2f} SOL\n"
+                    f"🔗 [Solscan](https://solscan.io/tx/{sig})\n"
+                    f"📊 CrypsScore: *{score}/10*"
+                )
+            elif tx_type == "TOKEN_MINT":
+                send_tg(
+                    f"⚡ *New Token Minted*\n"
+                    f"🪙 {token_mint}\n"
+                    f"🔗 [Solscan](https://solscan.io/token/{token_mint})\n"
+                    f"📊 CrypsScore: *{score}/10*"
+                )
+            elif score >= 7:
+                send_tg(
+                    f"🚀 *Winner Candidate Found*\n"
+                    f"🔗 [Solscan](https://solscan.io/tx/{sig})\n"
+                    f"📊 CrypsScore: *{score}/10*"
+                )
 
-    elif msg in ["/scan", "scan"]:
-        send_tg("🔍 *Cryps Ultra Scanner*\nScanning latest on-chain mints & whales...")
+        except Exception as e:
+            app.logger.warning(f"[HEL] tx parse error: {e}")
 
-    elif msg in ["/kinchi", "kinchi"]:
-        send_tg("📊 *Live Whale Heatmap*\nCollecting data from Helius feed...")
-
-    elif msg in ["/winners", "winners"]:
-        send_tg("🏆 *Top Winner Tokens* (last 24h)\n(coming soon module v1.1)")
-
-    return jsonify(ok=True)
-
-# ==========================
-# 🏠 Home route
-# ==========================
-@app.route("/")
-def home():
-    return "Cryps Ultra Pilot on Render ✅"
-
-# ==========================
-# 🔥 Run
-# ==========================
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
-
-
-app.logger.info(f"[HEL] headers keys={list(request.headers.keys())}")
-app.logger.info(f"[HEL] query secret present={bool(request.args.get('secret'))}")
+    return jsonify(ok=True), 200
