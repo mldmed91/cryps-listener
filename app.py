@@ -5,7 +5,7 @@ app = Flask(__name__)
 
 BOT = os.getenv("BOT_TOKEN")
 CHAT = os.getenv("CHAT_ID")
-HEL_SECRET = os.getenv("HEL_SECRET", "cryps_secret_943k29")
+HEL_SECRET = os.getenv("HEL_SECRET") or os.getenv("HEL_WEBHOOK_SECRET") or "cryps_secret_943k29"
 
 def send_tg(text):
     try:
