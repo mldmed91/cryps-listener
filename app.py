@@ -1,5 +1,8 @@
-@app.route("/hel-webhook", methods=["POST"])
-def hel_webhook():
+if isinstance(data, list):
+    txs = data
+elif isinstance(data, dict):
+    txs = data.get("transactions") ...
+    
     expected = HEL_SECRET or ""
     # مصادقة: X-Cryps-Secret أو Authorization: Bearer أو ?secret=
     got = request.headers.get("X-Cryps-Secret") or request.args.get("secret") or ""
