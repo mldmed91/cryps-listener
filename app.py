@@ -112,3 +112,7 @@ def home():
 # ==========================
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
+
+
+app.logger.info(f"[HEL] headers keys={list(request.headers.keys())}")
+app.logger.info(f"[HEL] query secret present={bool(request.args.get('secret'))}")
