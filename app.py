@@ -1,64 +1,97 @@
-# app.py (خلاصة سكيليتون)
+# app.py
 from flask import Flask, request, jsonify
 import os, requests
 
 app = Flask(__name__)
 
-BOT = os.getenv("BOT_TOKEN"); CHAT = os.getenv("CHAT_ID")
-HEL_SECRET = os.getenv("HEL_SECRET", "cryps_secret_943k29")
+BOT = os.getenv("BOT_TOKEN")
+CHAT = os.getenv("CHAT_ID")
+
+# نقرا السر من HEL_WEBHOOK_SECRET (أو HEL_SECRET باش نغطّيو الحالتين)
+HEL_SECRET = os.getenv("HEL_WEBHOOK_SECRET") or os.getenv("HEL_SECRET") or "cryps_secret_943k29"
+
+TG_API = "https://api.telegram.org/bot{}/sendMessage".format(BOT)
 
 def send_tg(text):
+    if not (BOT and CHAT):
+        return
     try:
-        requests.get(f"https://api.telegram.org/bot{BOT}/sendMessage",
-                     params={"chat_id": CHAT, "text": text, "parse_mode":"Markdown"})
-    except: pass
+        requests.get(
+            TG_API,
+            params={"chat_id": CHAT, "text": text, "parse_mode": "Markdown"},
+            timeout=6,
+        )
+    except Exception:
+        pass
 
 @app.route("/")
 def home():
     return "Cryps Listener on Render ✅"
 
+# ـ Telegram bot webhook
 @app.route("/tg-webhook", methods=["POST"])
 def tg_webhook():
-    data = request.get_json(force=True) or {}
-    msg = (data.get("message") or {}).get("text","").strip().lower()
-    if msg in ["/start", "start"]:
-        send_tg("✅ Cryps Listener online.\nCommands: /scan")
-    elif msg in ["/scan", "scan"]:
+    data = request.get_json(silent=True) or {}
+    msg = (data.get("message") or {}).get("text", "") or ""
+    txt = msg.strip().lower()
+
+    if txt in ("/start", "start"):
+        send_tg("✅ *Cryps Listener online.*\nCommands: /scan")
+    elif txt in ("/scan", "scan"):
         send_tg("🤖 Got: Scan")
-    elif msg in ["kinchi","/kinchi"]:
+    elif txt in ("kinchi", "/kinchi"):
         send_tg("🤖 Got: Kinchi")
-    return jsonify(ok=True)
 
-@app.route("/hel-webhook", methods=["POST"])
-def hel_webhook():
-    if request.headers.get("X-Cryps-Secret") != HEL_SECRET:
-        return ("", 403)
-    evt = request.get_json(force=True) or {}
-    # تقدّر تزائد: parsing للسواب/المينت + send_tg على الإشارات
-    return jsonify(ok=True)
+    return jsonify(ok=True), 200
 
+# ـ Helius webhook (واحد فقط!)
 @app.route("/hel-webhook", methods=["POST"])
-def hel_webhook():
+def hel_webhook_listener():
+    # تحقق من السرّ
     secret = request.headers.get("X-Cryps-Secret")
     if secret != HEL_SECRET:
         return jsonify({"error": "unauthorized"}), 403
 
-    data = request.json
-    if not data: 
-        return jsonify({"status": "no_data"}), 400
+    payload = request.get_json(silent=True) or {}
 
-    for tx in data.get("transactions", []):
+    # Helius Enhanced webhooks: كنلقاو لائحة transactions
+    txs = payload.get("transactions") or []
+    for tx in txs:
         sig = tx.get("signature")
-        accounts = [a.get("account") for a in tx.get("accounts", [])]
-        token = tx.get("tokenTransfers", [{}])[0].get("mint", "Unknown")
-        sol_value = tx.get("nativeTransfers", [{}])[0].get("amount", 0) / 1e9
 
-        # Whale Alert Filter
-        if sol_value > 5:
-            send_tg(f"🦈 Whale Detected!\n💰 {sol_value:.2f} SOL\n🔗 https://solscan.io/tx/{sig}")
+        # SOL value (إن وُجد)—nativeTransfers كيكون بلامات/lamports
+        sol_value = 0.0
+        try:
+            native = (tx.get("nativeTransfers") or [{}])[0]
+            sol_value = float(native.get("amount", 0)) / 1e9
+        except Exception:
+            pass
 
-        # New Mint Detector
-        if tx.get("type") == "TOKEN_MINT":
-            send_tg(f"⚡ New Token Minted\n🪙 Mint: {token}\n🔗 https://solscan.io/token/{token}")
+        # نوع الترانزاكسيون
+        tx_type = tx.get("type", "")
 
+        # Mint address (إن وُجد)
+        mint = None
+        try:
+            mint = (tx.get("tokenTransfers") or [{}])[0].get("mint")
+        except Exception:
+            pass
+
+        # 🦈 Whale filter
+        if sol_value and sol_value > 5:
+            send_tg(
+                f"🦈 *Whale Detected!*\n"
+                f"💰 {sol_value:.2f} SOL\n"
+                f"🔗 https://solscan.io/tx/{sig}"
+            )
+
+        # ⚡ New mint
+        if tx_type == "TOKEN_MINT" and mint:
+            send_tg(
+                f"⚡ *New Token Minted*\n"
+                f"🪙 Mint: `{mint}`\n"
+                f"🔗 https://solscan.io/token/{mint}"
+            )
+
+    # رجّع OK بسرعة (Helius خاصو 2xx)
     return jsonify({"status": "ok"}), 200
