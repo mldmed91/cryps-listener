@@ -1,314 +1,235 @@
-# app.py — Cryps Ultra Pilot v1.3
+# app.py — Cryps Ultra Pilot v1.4 (Helius Sync Enabled)
 from flask import Flask, request, jsonify
 import os, json, time, datetime as dt, requests
-from typing import Any, Dict, List
 
 app = Flask(__name__)
 
-# ========= ENV =========
+# ====== ENVIRONMENT ======
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-CHAT_ID   = os.getenv("CHAT_ID", "")
-HEL_SECRET = (
-    os.getenv("HEL_SECRET")
-    or os.getenv("HEL_WEBHOOK_SECRET")
-    or "cryps_secret_943k29"
-)
+CHAT_ID = os.getenv("CHAT_ID", "")
+HEL_SECRET = os.getenv("HEL_SECRET", "cryps_secret_943k29")
 
-# ========= DATA FILES =========
-DATA_DIR      = os.getenv("DATA_DIR", "data")
-TOKENS_FILE   = os.path.join(DATA_DIR, "tokens.json")   # events cache
-SIGNALS_FILE  = os.path.join(DATA_DIR, "signals.log")   # text log
-WHALES_FILE   = os.path.join(DATA_DIR, "whales.txt")    # one address per line
-RAY_FILE      = os.path.join(DATA_DIR, "raydium_pools.json")  # optional list[]
+HELIUS_API = os.getenv("HELIUS_API_KEY", "")
+HELIUS_WID = os.getenv("HELIUS_WEBHOOK_ID", "")
+PUBLIC_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+
+# ====== FILES ======
+DATA_DIR = "data"
+TOKENS_FILE = os.path.join(DATA_DIR, "tokens.json")
+SIGNALS_FILE = os.path.join(DATA_DIR, "signals.log")
+WHALES_FILE = os.path.join(DATA_DIR, "whales.txt")
+RAY_FILE = os.path.join(DATA_DIR, "raydium_pools.json")
 
 os.makedirs(DATA_DIR, exist_ok=True)
-if not os.path.exists(TOKENS_FILE):
-    with open(TOKENS_FILE, "w", encoding="utf-8") as f:
-        json.dump([], f)
-if not os.path.exists(SIGNALS_FILE):
-    open(SIGNALS_FILE, "a", encoding="utf-8").close()
-if not os.path.exists(WHALES_FILE):
-    open(WHALES_FILE, "a", encoding="utf-8").close()
-if not os.path.exists(RAY_FILE):
-    with open(RAY_FILE, "w", encoding="utf-8") as f:
-        json.dump([], f)
+for f, default in [
+    (TOKENS_FILE, []),
+    (SIGNALS_FILE, ""),
+    (WHALES_FILE, ""),
+    (RAY_FILE, []),
+]:
+    if not os.path.exists(f):
+        with open(f, "w", encoding="utf-8") as out:
+            if isinstance(default, list):
+                json.dump(default, out)
+            else:
+                out.write(default)
 
-# ========= HELPERS =========
-def now_ts() -> int:
+# ====== HELPERS ======
+def now_ts():
     return int(time.time())
 
-def send_tg(text: str) -> None:
-    """Send message to Telegram if BOT_TOKEN & CHAT_ID are present."""
-    if not (BOT_TOKEN and CHAT_ID):
-        return
+def send_tg(msg: str):
+    if not (BOT_TOKEN and CHAT_ID): return
     try:
         requests.get(
             f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            params={"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"},
-            timeout=8,
+            params={"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"},
+            timeout=8
         )
-    except Exception:
-        pass
+    except: pass
 
-def log_line(msg: str) -> None:
+def log(msg: str):
     try:
-        with open(SIGNALS_FILE, "a", encoding="utf-8") as log:
-            log.write(f"{dt.datetime.utcnow().isoformat()}Z | {msg}\n")
-    except Exception:
-        pass
+        with open(SIGNALS_FILE, "a", encoding="utf-8") as f:
+            f.write(f"{dt.datetime.utcnow().isoformat()}Z | {msg}\n")
+    except: pass
 
-def load_json(path: str, default):
+def read_whales():
+    try:
+        with open(WHALES_FILE, "r", encoding="utf-8") as f:
+            return [l.strip() for l in f if l.strip()]
+    except: return []
+
+def write_whales(lst):
+    with open(WHALES_FILE, "w", encoding="utf-8") as f:
+        f.write("\n".join(lst))
+
+def add_whale(addr):
+    whales = read_whales()
+    if addr not in whales:
+        whales.append(addr)
+        write_whales(whales)
+        return True
+    return False
+
+def remove_whale(addr):
+    whales = read_whales()
+    if addr in whales:
+        whales.remove(addr)
+        write_whales(whales)
+        return True
+    return False
+
+def load_json(path, default):
     try:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
-    except Exception:
+    except:
         return default
 
-def save_json(path: str, data: Any) -> None:
+def save_json(path, data):
     try:
         with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-    except Exception:
+            json.dump(data, f, indent=2)
+    except:
         pass
 
-def read_whales() -> List[str]:
+# ====== HELIUS SYNC ======
+def helius_sync_addresses():
+    """يحدّث العناوين عند Helius"""
+    if not (HELIUS_API and HELIUS_WID and PUBLIC_URL):
+        return False, "HELIUS envs missing"
+    addrs = read_whales()
+    payload = {
+        "webhookURL": f"{PUBLIC_URL}/hel-webhook?secret={HEL_SECRET}",
+        "transactionTypes": ["ANY"],
+        "accountAddresses": addrs,
+        "webhookType": "enhanced"
+    }
+    url = f"https://api.helius.xyz/v0/webhooks/{HELIUS_WID}?api-key={HELIUS_API}"
     try:
-        with open(WHALES_FILE, "r", encoding="utf-8") as f:
-            return [ln.strip() for ln in f if ln.strip()]
-    except Exception:
-        return []
+        r = requests.put(url, json=payload, timeout=10)
+        ok = r.status_code in (200, 201)
+        log(f"[HELIUS] Sync {len(addrs)} addresses -> {r.status_code}")
+        return ok, r.text
+    except Exception as e:
+        log(f"[HELIUS] Sync error {e}")
+        return False, str(e)
 
-def write_whales(addrs: List[str]) -> None:
-    with open(WHALES_FILE, "w", encoding="utf-8") as f:
-        f.write("\n".join(addrs) + ("\n" if addrs else ""))
-
-def add_whale(addr: str) -> bool:
-    addr = (addr or "").strip()
-    if not addr or len(addr) < 30:
-        return False
-    whales = read_whales()
-    if addr in whales:
-        return False
-    whales.append(addr)
-    write_whales(whales)
-    return True
-
-def remove_whale(addr: str) -> bool:
-    addr = (addr or "").strip()
-    whales = read_whales()
-    if addr not in whales:
-        return False
-    whales = [w for w in whales if w != addr]
-    write_whales(whales)
-    return True
-
-def ray_accounts_set():
-    try:
-        arr = load_json(RAY_FILE, [])
-        return set(arr if isinstance(arr, list) else [])
-    except Exception:
-        return set()
-
-# ========= MINI DB / ANALYTICS =========
-def upsert_token_event(event: Dict[str, Any]) -> None:
-    """Append event; keep last 10k."""
-    db = load_json(TOKENS_FILE, [])
-    db.append(event)
-    if len(db) > 10000:
-        db = db[-10000:]
-    save_json(TOKENS_FILE, db)
-
-def winners_last_24h(limit: int = 10) -> List[Dict[str, Any]]:
-    """Aggregate events in last 24h by mint and rank by SOL sum / count / recency."""
-    db = load_json(TOKENS_FILE, [])
-    cutoff = now_ts() - 24 * 3600
-    agg: Dict[str, Dict[str, Any]] = {}
-    for e in db:
-        if e.get("ts", 0) < cutoff:
-            continue
-        mint = e.get("mint") or "Unknown"
-        rec = agg.setdefault(
-            mint, {"mint": mint, "count": 0, "sol_sum": 0.0, "last_sig": "", "last_ts": 0}
-        )
-        rec["count"] += 1
-        rec["sol_sum"] += float(e.get("sol_value", 0.0) or 0.0)
-        if e.get("ts", 0) >= rec["last_ts"]:
-            rec["last_sig"] = e.get("signature", "")
-            rec["last_ts"] = e.get("ts", 0)
-    ranked = sorted(
-        agg.values(), key=lambda x: (x["sol_sum"], x["count"], x["last_ts"]), reverse=True
-    )
-    return ranked[:limit]
-
-# ========= ROUTES =========
+# ====== ROUTES ======
 @app.get("/")
 def home():
-    return "Cryps Ultra Pilot v1.3 ✅"
+    return "✅ Cryps Ultra Pilot v1.4 — Active"
 
-@app.get("/healthz")
-def healthz():
-    return jsonify(ok=True, ts=now_ts(), whales=len(read_whales()))
+@app.get("/sync-helius")
+def sync_helius():
+    ok, msg = helius_sync_addresses()
+    return jsonify(ok=ok, msg=msg, whales=len(read_whales()))
 
-# ----- TELEGRAM WEBHOOK -----
+# ====== TELEGRAM ======
 @app.post("/tg-webhook")
 def tg_webhook():
-    """Handle Telegram updates (commands)."""
     data = request.get_json(silent=True) or {}
     msg = ((data.get("message") or {}).get("text") or "").strip()
     low = msg.lower()
 
     if low in ("/start", "start"):
-        send_tg(
-            "✅ *Cryps Ultra Pilot Online*\n"
-            "Commands: `/scan` | `/winners` | `/kinchi` | `/whales`\n"
-            "Admin: `/whale_add <addr>` `/whale_remove <addr>`"
-        )
+        send_tg("✅ *Cryps Ultra Pilot Online*\nCommands: `/scan`, `/winners`, `/kinchi`, `/whales`\nAdmin: `/whale_add <addr>`, `/whale_remove <addr>`")
         return jsonify(ok=True)
 
     if low in ("/scan", "scan"):
         send_tg("🔎 *Cryps Ultra Scanner*\nScanning latest on-chain mints & whales…")
-        log_line("TG: /scan")
-        return jsonify(ok=True)
-
-    if low in ("/winners", "winners"):
-        top = winners_last_24h(10)
-        if not top:
-            send_tg("🏆 *Top Winner Tokens (24h)*\nNo data yet.")
-            return jsonify(ok=True)
-        lines = ["🏆 *Top Winner Tokens (24h)*"]
-        for i, r in enumerate(top, 1):
-            mint, sol, cnt, sig = r["mint"], r["sol_sum"], r["count"], r["last_sig"]
-            solscan = f"https://solscan.io/tx/{sig}" if sig else ""
-            tokurl = f"https://solscan.io/token/{mint}" if mint != "Unknown" else ""
-            lines.append(f"{i}. `{mint}` • {sol:.2f} SOL • {cnt} txs")
-            if tokurl:
-                lines.append(tokurl)
-            if solscan:
-                lines.append(solscan)
-        send_tg("\n".join(lines))
-        log_line("TG: /winners")
         return jsonify(ok=True)
 
     if low in ("/kinchi", "kinchi"):
         send_tg("📊 *Live Whale Heatmap*\nCollecting signals from Helius…")
-        log_line("TG: /kinchi")
         return jsonify(ok=True)
 
-    if low.startswith("/whale_add") or low.startswith("whale_add"):
+    if low in ("/winners", "winners"):
+        db = load_json(TOKENS_FILE, [])
+        if not db:
+            send_tg("🏆 *Top Winner Tokens (24h)*\nNo data yet.")
+            return jsonify(ok=True)
+        lines = ["🏆 *Top Winner Tokens (24h)*"]
+        recent = [d for d in db if d.get("ts", 0) > now_ts() - 86400]
+        top = sorted(recent, key=lambda x: x.get("sol_value", 0), reverse=True)[:10]
+        for i, t in enumerate(top, 1):
+            lines.append(f"{i}. `{t.get('mint')}` • {t.get('sol_value', 0):.2f} SOL\n🔗 https://solscan.io/tx/{t.get('signature')}")
+        send_tg("\n".join(lines))
+        return jsonify(ok=True)
+
+    if low in ("/whales", "whales"):
+        whales = read_whales()
+        if not whales:
+            send_tg("No whales yet.")
+        else:
+            send_tg("*Whales List:* \n" + "\n".join([f"{i+1}. `{a}`" for i,a in enumerate(whales)]))
+        return jsonify(ok=True)
+
+    if low.startswith("/whale_add"):
         parts = msg.split()
-        if len(parts) >= 2 and len(parts[1]) >= 30:
+        if len(parts) >= 2:
             ok = add_whale(parts[1])
-            send_tg(f"➕ Added whale: `{parts[1]}`" if ok else f"Already/invalid: `{parts[1]}`")
+            send_tg(f"➕ Added whale: `{parts[1]}`" if ok else "Already exists or invalid.")
+            helius_sync_addresses()
         else:
             send_tg("Usage: `/whale_add <WALLET_ADDRESS>`")
         return jsonify(ok=True)
 
-    if low.startswith("/whale_remove") or low.startswith("whale_remove"):
+    if low.startswith("/whale_remove"):
         parts = msg.split()
         if len(parts) >= 2:
             ok = remove_whale(parts[1])
-            send_tg(f"➖ Removed: `{parts[1]}`" if ok else f"Not found: `{parts[1]}`")
+            send_tg(f"➖ Removed whale: `{parts[1]}`" if ok else "Not found.")
+            helius_sync_addresses()
         else:
             send_tg("Usage: `/whale_remove <WALLET_ADDRESS>`")
         return jsonify(ok=True)
 
-    if low in ("/whales", "whales"):
-        w = read_whales()
-        send_tg("No whales yet." if not w else f"*Whales ({len(w)})*\n" + "\n".join([f"{i+1}. `{a}`" for i,a in enumerate(w[:50])]))
-        return jsonify(ok=True)
-
-    # default
-    send_tg(f"🤖 Unknown command: `{msg}`")
     return jsonify(ok=True)
 
-# ----- HELIUS WEBHOOK -----
+# ====== HELIUS WEBHOOK ======
 @app.post("/hel-webhook")
 def hel_webhook():
-    """Receive Enhanced Webhook payloads from Helius."""
-    header_secret = request.headers.get("X-Cryps-Secret") or request.headers.get("x-cryps-secret")
-    query_secret  = request.args.get("secret")
-    if (header_secret or query_secret) != HEL_SECRET:
-        log_line(f"[HEL] SECRET MISMATCH: got='{header_secret or query_secret}' expected='{HEL_SECRET}'")
+    secret = request.args.get("secret") or request.headers.get("X-Cryps-Secret")
+    if secret != HEL_SECRET:
         return jsonify(error="unauthorized"), 403
 
     evt = request.get_json(silent=True)
-    if evt is None:
+    if not evt:
         return jsonify(error="no_json"), 400
 
-    # Accept dict({"transactions": [...]}) or list([...])
-    if isinstance(evt, dict):
-        txs = evt.get("transactions", []) or []
-    elif isinstance(evt, list):
-        txs = evt
-    else:
-        txs = []
-
+    txs = evt.get("transactions", []) if isinstance(evt, dict) else evt
     whales = set(read_whales())
-    rayset  = ray_accounts_set()
 
-    n_mints = n_swaps = n_whales = 0
+    n_whales = n_mints = 0
+    db = load_json(TOKENS_FILE, [])
+
     for tx in txs:
         try:
-            sig   = tx.get("signature") or tx.get("signatureId") or ""
-            ttype = (tx.get("type") or "").upper()         # TOKEN_MINT / SWAP / TRANSFER...
-            ts    = int(tx.get("timestamp") or now_ts())
-
-            # SOL value
-            sol_value = 0.0
-            for nt in tx.get("nativeTransfers", []) or []:
-                amt = float(nt.get("amount", 0) or 0)
-                sol_value += (amt / 1e9) if amt > 1e6 else amt
-
-            # mint if present
+            sig = tx.get("signature", "")
+            ttype = tx.get("type", "").upper()
+            ts = int(tx.get("timestamp", now_ts()))
+            sol_value = sum([(nt.get("amount", 0)/1e9) for nt in tx.get("nativeTransfers", []) or []])
             mint = None
             if tx.get("tokenTransfers"):
-                mt = [tt.get("mint") for tt in tx["tokenTransfers"] if tt.get("mint")]
-                mint = mt[0] if mt else None
-
-            # accounts
-            accounts = [a.get("account") for a in tx.get("accounts", []) or [] if a.get("account")]
-            is_whale = bool(whales and accounts and any(a in whales for a in accounts))
-            is_ray   = bool(rayset and accounts and any(a in rayset for a in accounts))
-
-            # persist minimal event
-            kind = "TRANSFER"
-            if "MINT" in ttype:
-                kind = "MINT"; n_mints += 1
-            elif "SWAP" in ttype:
-                kind = "SWAP"; n_swaps += 1
-
-            upsert_token_event({
-                "type": kind, "mint": mint, "signature": sig,
-                "sol_value": sol_value, "ts": ts
-            })
-
-            # alerts
-            alert_lines = []
-            if is_whale:
+                mints = [t.get("mint") for t in tx["tokenTransfers"] if t.get("mint")]
+                mint = mints[0] if mints else None
+            accounts = [a.get("account") for a in tx.get("accounts", []) or []]
+            if any(a in whales for a in accounts):
                 n_whales += 1
-                alert_lines.append("🦈 *Whale TX*")
+                send_tg(f"🐋 Whale TX • {sol_value:.2f} SOL\n🪙 `{mint}`\n🔗 https://solscan.io/tx/{sig}")
             if "MINT" in ttype:
-                alert_lines.append("⚡ *New Mint*")
-            elif "SWAP" in ttype:
-                alert_lines.append("💱 *Swap*")
-            elif sol_value >= 2.0:
-                alert_lines.append("💸 *Big Transfer*")
-            if is_ray:
-                alert_lines.append("♻️ Raydium")
-
-            if alert_lines:
-                txt = " | ".join(alert_lines) + f"\n🪙 `{mint or 'Unknown'}` • {sol_value:.2f} SOL\n🔗 https://solscan.io/tx/{sig}"
-                send_tg(txt)
-
+                n_mints += 1
+            db.append({"signature": sig, "mint": mint, "sol_value": sol_value, "ts": ts})
         except Exception as e:
-            log_line(f"[HEL] parse_error: {repr(e)}")
+            log(f"[HEL] parse error {e}")
 
-    if n_mints or n_swaps or n_whales:
-        send_tg(f"📡 *Helius Feed*\nMints: *{n_mints}* • Swaps: *{n_swaps}* • Whales: *{n_whales}*")
+    save_json(TOKENS_FILE, db[-1000:])
+    send_tg(f"📡 Feed: {n_mints} mints, {n_whales} whale txs")
+    return jsonify(ok=True)
 
-    return jsonify(ok=True, parsed=len(txs), mints=n_mints, swaps=n_swaps, whales=n_whales)
-
-# ========= MAIN =========
+# ====== MAIN ======
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
