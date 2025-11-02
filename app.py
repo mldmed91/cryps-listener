@@ -1,4 +1,5 @@
-from pilot import pilot as pilot_mod
+# pilot module
+from pilot.pilot import ingest_txn, pilot_add_event, pilot_top_winners
 
 # Cryps Ultra Pilot v1.2 — full ready version
 from flask import Flask, request, jsonify
