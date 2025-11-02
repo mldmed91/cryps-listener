@@ -62,17 +62,23 @@ def tg_webhook():
         send_tg("✅ *Cryps Ultra Pilot Active*\nCommands: `/scan`, `/winners`, `/kinchi`, `/whales`")
         return jsonify(ok=True)
 
-    if msg in ("/winners", "winners"):
-        winners = pilot_top_winners()
-        if not winners:
-            send_tg("🏆 *No winners yet*")
+   elif lower in ("/winners", "winners"):
+    try:
+        top = pilot_top_winners()  # جاي من pilot.pilot
+        if not top:
+            send_tg("🏆 *Top Winner Tokens (24h)*\nلا بيانات حتى الآن.")
             return jsonify(ok=True)
+
         lines = ["🏆 *Top Winner Tokens (24h)*"]
-        for i, r in enumerate(winners[:10], 1):
-            lines.append(f"{i}. `{r['mint']}` • Score {r['score']} • 🦈 {r['whale_in']} • {r['sol_in']} SOL")
-            lines.append(f"https://solscan.io/token/{r['mint']}")
+        for i, r in enumerate(top, 1):
+            mint = r.get("mint", "Unknown")
+            score = r.get("score", 0)
+            lines.append(f"{i}. `{mint}` • Score {score}/10")
+            lines.append(f"https://solscan.io/token/{mint}")
         send_tg("\n".join(lines))
-        return jsonify(ok=True)
+    except Exception as e:
+        log_line(f"[WINNERS_ERR] {repr(e)}")
+    return jsonify(ok=True)
 
     if msg in ("/whales", "whales"):
         whales = read_whales()
