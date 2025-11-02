@@ -1,6 +1,11 @@
 # pilot module
 from pilot.pilot import ingest_txn, pilot_add_event, pilot_top_winners
 
+from pilot.kinchi import kinchi_top
+from pilot.winners import winners_24h
+from pilot.qa import qa_summary
+from pilot.consensus import seen, mark
+
 # Cryps Ultra Pilot v1.2 — full ready version
 from flask import Flask, request, jsonify
 import os, json, time, datetime as dt, requests
