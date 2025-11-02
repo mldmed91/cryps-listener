@@ -241,7 +241,26 @@ def hel_webhook():
     if evt is None: return jsonify(status="no_json"), 400
 
     # dict({"transactions":[...]}) أو list([...])
-    txs = evt.get("transactions", []) if isinstance(evt, dict) else (evt if isinstance(evt, list) else [])
+  with open("data/signals.log", "a") as log:
+    log.write(json.dumps(evt) + "\n")
+
+if "transactions" in evt:
+    for tx in evt["transactions"]:
+        try:
+            if "MINT" in tx.get("type", "").upper():
+                with open("data/tokens.json", "r+") as f:
+                    data = json.load(f)
+                    data.append({
+                        "timestamp": int(time.time()),
+                        "mint": tx.get("tokenTransfers", [{}])[0].get("mint", ""),
+                        "type": "MINT",
+                        "sol": tx.get("nativeTransfers", [{}])[0].get("amount", 0),
+                        "whales": len(tx.get("accounts", []))
+                    })
+                    f.seek(0)
+                    json.dump(data, f, indent=2)
+        except Exception as err:
+            print("Error saving tx:", err)
 
     db = load_tokens()
     whales = set(read_whales())
