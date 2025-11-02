@@ -1,3 +1,5 @@
+from pilot import pilot as pilot_mod
+
 # Cryps Ultra Pilot v1.2 — full ready version
 from flask import Flask, request, jsonify
 import os, json, time, datetime as dt, requests
