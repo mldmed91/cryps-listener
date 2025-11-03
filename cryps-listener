@@ -1,13 +1,9 @@
 cryps-listener/
-├─ app.py                # كاين دابا – نعدلوه باش ينادي Pilot
-├─ pilot/
-│  ├─ __init__.py
-│  └─ pilot.py           # الموديول الذكي
-├─ data/
-│  ├─ whales.txt         # عناوين الحيتان (Already)
-│  ├─ tokens.json        # cache آخر التوكنز/السكورات
-│  ├─ winners.json       # نكتبو فيه Top Winners آخر 24h
-│  ├─ raydium_pools.json # pools لي كنراقبو
-│  └─ signals.log        # لوج للإشارات
-└─ utils/
-   └─ io.py              # helpers للقراءة/الكتابة (اختياري)
+├─ app.py
+├─ requirements.txt
+├─ Procfile
+├─ runtime.txt            (اختياري)
+└─ data/
+   ├─ whales.txt
+   ├─ tokens.json
+   └─ signals.log
