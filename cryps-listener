@@ -2,8 +2,9 @@ cryps-listener/
 ├─ app.py
 ├─ requirements.txt
 ├─ Procfile
-├─ runtime.txt            (اختياري)
-└─ data/
-   ├─ whales.txt
-   ├─ tokens.json
-   └─ signals.log
+├─ .env.sample
+├─ data/
+│  ├─ tokens.json
+│  ├─ whales.txt
+│  └─ signals.log
+└─ README.md
