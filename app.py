@@ -217,7 +217,7 @@ def _parse_duration(s: str) -> int:
         return int(float(s[:-1]))
     return int(float(s))  # assume minutes
 
-def scan_recent_winners(lookback_min: int = 15, max_hits: int = 10):
+def scan_recent_winners(lookback_min: int = 30, max_hits: int = 10):
     """
     سكان خفيف: كيجبد آخر معاملات من برامج Raydium ويحسب CrypsScore
     كافي باش يعطيك winners لما تبغيهم.
@@ -308,7 +308,7 @@ def tg_webhook():
         else:
             tg_send(f"✅ تصيّدنا {sent} winner(s).")
     elif text.startswith("/start") or text.startswith("/help"):
-        tg_send("👋 أوامر متاحة:\n/winners [15m] — جِب winners فآخر مدة (m أو h).")
+        tg_send("👋 أوامر متاحة:\n/winners [30m] — جِب winners فآخر مدة (m أو h).")
     else:
         # تجاهل أي شيء آخر
         pass
