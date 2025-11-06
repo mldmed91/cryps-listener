@@ -207,7 +207,113 @@ def index():
 
 def ok():
     return jsonify({"ok": True})
+# ===== Telegram commands webhook =====
+def _parse_duration(s: str) -> int:
+    # returns minutes
+    s = s.strip().lower()
+    if s.endswith("h"):
+        return int(float(s[:-1]) * 60)
+    if s.endswith("m"):
+        return int(float(s[:-1]))
+    return int(float(s))  # assume minutes
 
+def scan_recent_winners(lookback_min: int = 15, max_hits: int = 10):
+    """
+    سكان خفيف: كيجبد آخر معاملات من برامج Raydium ويحسب CrypsScore
+    كافي باش يعطيك winners لما تبغيهم.
+    """
+    sent = 0
+    since_ts = int(time.time() - lookback_min * 60)
+
+    for program in list(RAYDIUM_PROGRAMS):
+        if sent >= max_hits:
+            break
+        try:
+            url = f"https://api.helius.xyz/v0/addresses/{program}/transactions?api-key={HELIUS_API_KEY}"
+            r = S.get(url, params={"limit": 100}, timeout=10)
+            if r.status_code != 200:
+                continue
+            txs = r.json() or []
+            for tx in txs:
+                # basic time filter
+                blk_time = int(tx.get("timestamp", 0) or 0)
+                if blk_time and blk_time < since_ts:
+                    continue
+
+                # collect accounts + token mints
+                account_keys = list(set((tx.get("accountKeys") or []) + (tx.get("accounts") or [])))
+                token_transfers = tx.get("tokenTransfers") or []
+                owners = set()
+                mints = set()
+                for tr in token_transfers:
+                    m = tr.get("mint") or tr.get("tokenAddress")
+                    if m: mints.add(m)
+                    if tr.get("fromUserAccount"): owners.add(tr["fromUserAccount"])
+                    if tr.get("toUserAccount"): owners.add(tr["toUserAccount"])
+
+                for mint in mints:
+                    if seen_recent(mint):
+                        continue
+                    score, info = compute_cryps_score(mint, account_keys, owners)
+                    if score < 9:
+                        continue
+
+                    solscan_link = SOLSCAN_MINT.format(mint)
+                    ds_link = info.get("pair_url") or DEXSCREENER.format(mint)
+                    msg = (
+                        "🏆 <b>Winner Token</b>\n"
+                        f"<code>{mint}</code>\n"
+                        f"Raydium: <b>{'yes' if info.get('raydium') else 'no'}</b> | "
+                        f"Whales: <b>{info.get('whale_hits',0)}</b> | "
+                        f"Wallets: <b>{info.get('unique_wallets',0)}</b>\n"
+                        f"Liquidity: <b>{human_usd(info.get('liquidity_usd'))}</b> | "
+                        f"24h Vol: <b>{human_usd(info.get('h24_volume_usd'))}</b> | "
+                        f"1h TXs: <b>{info.get('txns_h1')}</b>\n"
+                        f'<a href="{solscan_link}">Solscan</a> | <a href="{ds_link}">DexScreener</a>\n'
+                        f"CrypsScore: <b>{score}/12</b>"
+                    )
+                    tg_send(msg, preview=True)
+                    sent += 1
+                    if sent >= max_hits:
+                        break
+            # next program...
+        except Exception as e:
+            print("[scan_recent_winners] error:", e)
+            continue
+    return sent
+
+@app.post("/tg-webhook")
+def tg_webhook():
+    update = request.get_json(force=True, silent=True) or {}
+    msg = (update.get("message") or update.get("edited_message")) or {}
+    chat = msg.get("chat", {})
+    text = (msg.get("text") or "").strip()
+
+    # اسمح فقط للـ CHAT_ID الموثوق
+    if str(chat.get("id")) != str(CHAT_ID):
+        return ok()
+
+    if text.startswith("/winners"):
+        parts = text.split()
+        look = 15
+        if len(parts) > 1:
+            try:
+                look = max(1, min(120, _parse_duration(parts[1])))
+            except Exception:
+                pass
+        tg_send(f"⏳ كنقلب على الفائزين فآخر {look} دقيقة…")
+        sent = scan_recent_winners(lookback_min=look, max_hits=10)
+        if not sent:
+            tg_send("✅ ما لقيناش winner واضح فهاد النافذة. جرّب زيد المدة: /winners 30m")
+        else:
+            tg_send(f"✅ تصيّدنا {sent} winner(s).")
+    elif text.startswith("/start") or text.startswith("/help"):
+        tg_send("👋 أوامر متاحة:\n/winners [15m] — جِب winners فآخر مدة (m أو h).")
+    else:
+        # تجاهل أي شيء آخر
+        pass
+    return ok()
+    
 # -----------------------------
 # HELIUS WEBHOOK
 # -----------------------------
@@ -268,7 +374,7 @@ def hel_webhook():
             score, info = compute_cryps_score(mint, account_keys, owners)
 
             # Filter: Winners only
-            if score < 9:
+            if score < 8:
                 # uncomment to debug low-score feed
                 # tg_send(f"🐣 Skipped {mint}\nCrypsScore: {score}/12")
                 continue
