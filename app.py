@@ -1,258 +1,311 @@
-import os, json, re
-from pathlib import Path
-from flask import Flask, request, jsonify
-from dotenv import load_dotenv
-import requests
-from datetime import datetime
+# app.py
+# -*- coding: utf-8 -*-
 
-# ===== Boot =====
-load_dotenv()
+import os
+import time
+import json
+import hmac
+import hashlib
+from datetime import datetime, timedelta
+from collections import deque, defaultdict
+
+from flask import Flask, request, jsonify, abort
+
+# dotenv اختياري
+try:
+    from dotenv import load_dotenv  # type: ignore
+    load_dotenv()
+except Exception:
+    pass
+
+import requests
+
+# -----------------------------
+# ENV
+# -----------------------------
+BOT_TOKEN         = os.getenv("BOT_TOKEN", "").strip()
+CHAT_ID           = os.getenv("CHAT_ID", "").strip()
+HELIUS_API_KEY    = os.getenv("HELIUS_API_KEY", "").strip()
+HEL_SECRET        = os.getenv("HEL_SECRET", "cryps_secret").strip()
+PUBLIC_BASE_URL   = os.getenv("PUBLIC_BASE_URL", "").strip()
+WHALES_FILE       = os.getenv("WHALES_FILE", "data/whales.txt").strip()
+
+if not BOT_TOKEN or not CHAT_ID:
+    print("[WARN] BOT_TOKEN/CHAT_ID not set: Telegram messages will be skipped.")
+
+# -----------------------------
+# CONSTANTS / RAYDIUM PROGRAMS
+# -----------------------------
+RAYDIUM_PROGRAMS = {
+    # Legacy AMM v4 (CP)
+    "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",
+    # CPMM (Constant Product)
+    "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C",
+    # CLMM (Concentrated Liquidity)
+    "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK",
+    # LaunchLab
+    "LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj",
+}
+
+SOLSCAN_TX   = "https://solscan.io/tx/{}"
+SOLSCAN_MINT = "https://solscan.io/token/{}"
+DEXSCREENER  = "https://dexscreener.com/solana/{}"
+
+# -----------------------------
+# DATA: whales
+# -----------------------------
+def load_whales(path: str) -> set:
+    addrs = set()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                a = line.strip()
+                if a and not a.startswith("#"):
+                    addrs.add(a)
+        print(f"[OK] Loaded whales: {len(addrs)} from {path}")
+    except Exception as e:
+        print(f"[WARN] whales file not loaded: {e}")
+    return addrs
+
+WHALES = load_whales(WHALES_FILE)
+
+# -----------------------------
+# UTILS
+# -----------------------------
+S = requests.Session()
+S.headers.update({"User-Agent": "Cryps-Ultra-Pilot/1.0"})
+
+def tg_send(text: str, preview: bool = True):
+    if not (BOT_TOKEN and CHAT_ID):
+        return
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": CHAT_ID,
+        "text"   : text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": not preview,
+    }
+    try:
+        S.post(url, json=payload, timeout=10)
+    except Exception as e:
+        print(f"[WARN] telegram send failed: {e}")
+
+def human_usd(v):
+    try:
+        v = float(v)
+    except Exception:
+        return "-"
+    if v >= 1_000_000:
+        return f"${v/1_000_000:.2f}M"
+    if v >= 1_000:
+        return f"${v/1_000:.2f}k"
+    return f"${v:.2f}"
+
+def get_dex_stats(mint: str):
+    """Quick stats from Dexscreener pair (if available)."""
+    try:
+        r = S.get(f"https://api.dexscreener.com/latest/dex/tokens/{mint}", timeout=6)
+        if r.status_code != 200:
+            return {}
+        data = r.json()
+        pairs = data.get("pairs") or []
+        # choose best pair (highest liquidity)
+        best = None
+        best_l = -1
+        for p in pairs:
+            l = float(p.get("liquidity", {}).get("usd", 0) or 0)
+            if l > best_l:
+                best = p
+                best_l = l
+        if not best:
+            return {}
+        return {
+            "liquidity_usd": float(best.get("liquidity", {}).get("usd", 0) or 0),
+            "h24_volume_usd": float(best.get("volume", {}).get("h24", 0) or 0),
+            "txns_h1": int(best.get("txns", {}).get("h1", {}).get("buys", 0)) + int(best.get("txns", {}).get("h1", {}).get("sells", 0)),
+            "pair_url": best.get("url") or f"{DEXSCREENER.format(mint)}",
+        }
+    except Exception:
+        return {}
+
+def any_raydium_program(account_keys: list) -> bool:
+    return any(a in RAYDIUM_PROGRAMS for a in account_keys or [])
+
+# -----------------------------
+# SCORING
+# -----------------------------
+def compute_cryps_score(mint: str, account_keys: list, owners: set) -> (int, dict):
+    """
+    Score (0..12) based on whale convergence + raydium + market hints.
+    """
+    score = 0
+    details = {}
+
+    # 1) Whale convergence
+    whale_hits = len([a for a in (account_keys or []) if a in WHALES])
+    score += min(whale_hits * 2, 6)  # 0..6
+    details["whale_hits"] = whale_hits
+
+    # 2) Unique wallets in tx set
+    uniq = len(owners)
+    if uniq >= 10: score += 2
+    elif uniq >= 5: score += 1
+    details["unique_wallets"] = uniq
+
+    # 3) Raydium signal (LP/route programs present)
+    if any_raydium_program(account_keys):
+        score += 2
+        details["raydium"] = True
+    else:
+        details["raydium"] = False
+
+    # 4) Market signal (Dexscreener)
+    ds = get_dex_stats(mint)
+    if ds:
+        liq = ds.get("liquidity_usd", 0.0)
+        vol = ds.get("h24_volume_usd", 0.0)
+        tx1 = ds.get("txns_h1", 0)
+        details.update(ds)
+        if liq >= 30_000: score += 2
+        elif liq >= 10_000: score += 1
+        if vol >= 50_000: score += 1
+        if tx1 >= 50: score += 1
+
+    return score, details
+
+# -----------------------------
+# DEDUP / RATE LIMIT
+# -----------------------------
+SEEN = {}  # mint -> ts
+TTL_MIN = 20 * 60  # 20 min dedup
+
+def seen_recent(mint: str) -> bool:
+    now = time.time()
+    t = SEEN.get(mint)
+    if t and now - t < TTL_MIN:
+        return True
+    SEEN[mint] = now
+    # cleanup
+    for k in list(SEEN.keys()):
+        if now - SEEN[k] > TTL_MIN:
+            SEEN.pop(k, None)
+    return False
+
+# -----------------------------
+# FLASK
+# -----------------------------
 app = Flask(__name__)
 
-DATA_DIR = Path("data")
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-TOKENS_JSON = DATA_DIR / "tokens.json"
-WHALES_TXT  = DATA_DIR / "whales.txt"
-SIGNALS_LOG = DATA_DIR / "signals.log"
+@app.get("/")
+def index():
+    return jsonify({
+        "app": "Cryps Ultra Pilot — Webhook",
+        "status": "ok",
+        "whales_loaded": len(WHALES),
+        "public_url": PUBLIC_BASE_URL or "unset",
+    })
 
-# defaults
-if not TOKENS_JSON.exists(): TOKENS_JSON.write_text("[]", encoding="utf-8")
-if not WHALES_TXT.exists():  WHALES_TXT.write_text("", encoding="utf-8")
-if not SIGNALS_LOG.exists(): SIGNALS_LOG.write_text("", encoding="utf-8")
-
-# ===== ENV =====
-BOT_TOKEN   = os.getenv("BOT_TOKEN", "").strip()
-CHAT_ID     = os.getenv("CHAT_ID", "").strip()
-TG_SECRET   = os.getenv("TG_SECRET", "").strip()    # query param secret for /tg-webhook
-HELIUS_SEC  = os.getenv("HELIUS_SECRET", "").strip()
-AUTO_MODE   = (os.getenv("AUTO_MODE", "false").lower() == "true")
-BASE_URL    = os.getenv("BASE_URL", "").strip()
-
-# ===== Helpers =====
-def now():
-    return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-
-def send_tg(text, chat_id=None, disable_preview=False):
-    """Simple Telegram sender (no lib)."""
-    if not BOT_TOKEN:
-        print("[TG] BOT_TOKEN missing")
-        return
-    chat_id = chat_id or CHAT_ID
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    try:
-        r = requests.post(url, json={
-            "chat_id": chat_id,
-            "text": text,
-            "disable_web_page_preview": disable_preview,
-            "parse_mode": "HTML",
-        }, timeout=10)
-        if r.status_code != 200:
-            print("[TG-ERR]", r.text)
-    except Exception as e:
-        print("[TG-EXC]", e)
-
-def read_whales():
-    return [ln.strip() for ln in WHALES_TXT.read_text(encoding="utf-8").splitlines() if ln.strip()]
-
-def add_whale(addr):
-    addr = addr.strip()
-    if not re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{32,44}", addr):
-        return False, "❌ address format not valid"
-    whales = set(read_whales())
-    if addr in whales:
-        return False, "ℹ️ address already in whales list"
-    whales.add(addr)
-    WHALES_TXT.write_text("\n".join(sorted(whales)), encoding="utf-8")
-    return True, "✅ whale added"
-
-def remove_whale(addr):
-    whales = set(read_whales())
-    if addr in whales:
-        whales.remove(addr)
-        WHALES_TXT.write_text("\n".join(sorted(whales)), encoding="utf-8")
-        return True, "✅ whale removed"
-    return False, "ℹ️ address not found"
-
-def load_tokens():
-    try:
-        return json.loads(TOKENS_JSON.read_text(encoding="utf-8"))
-    except:
-        return []
-
-def save_tokens(arr):
-    TOKENS_JSON.write_text(json.dumps(arr, ensure_ascii=False, indent=2), encoding="utf-8")
-
-def log_signal(line):
-    with open(SIGNALS_LOG, "a", encoding="utf-8") as f:
-        f.write(f"[{now()}] {line}\n")
-
-def solscan_token(mint):   return f"https://solscan.io/token/{mint}"
-def solscan_tx(sig):       return f"https://solscan.io/tx/{sig}"
-def dexscreener(mint):     return f"https://dexscreener.com/solana/{mint}"
-
-# ===== Routes =====
-@app.get("/healthz")
-def health(): return "ok", 200
-
-# --- Telegram webhook (secure by query ?secret=TG_SECRET)
-@app.post("/tg-webhook")
-def tg_webhook():
-    if TG_SECRET and request.args.get("secret") != TG_SECRET:
-        return jsonify({"error": "forbidden"}), 403
-
-    upd = request.get_json(silent=True) or {}
-    msg = (upd.get("message") or upd.get("edited_message")) or {}
-    text = (msg.get("text") or "").strip()
-    chat_id = msg.get("chat", {}).get("id") or CHAT_ID
-
-    if not text:
-        return jsonify({"ok": True})
-
-    # Commands
-    if text.startswith("/start"):
-        send_tg(
-            "✅ <b>Cryps Ultra Pilot Online</b>\n"
-            "Commands:\n"
-            "• /scan – ydir snapshot manual\n"
-            "• /winners – top winners (24h)\n"
-            "• /kinchi – snapshot mints & whales\n"
-            "• /whales – list\n"
-            "Admin:\n"
-            "• /whale_add &lt;addr&gt;\n"
-            "• /whale_remove &lt;addr&gt;\n"
-            "⚠️ AUTO_MODE: <b>OFF</b> (on-demand only)\n", chat_id)
-        return jsonify({"ok": True})
-
-    if text.startswith("/whales"):
-        whales = read_whales()
-        if not whales:
-            send_tg("Whales List: (empty)", chat_id)
-        else:
-            out = "\n".join([f"{i+1}. <code>{a}</code>" for i, a in enumerate(whales)])
-            send_tg(f"Whales List:\n{out}", chat_id, disable_preview=True)
-        return jsonify({"ok": True})
-
-    if text.startswith("/whale_add"):
-        parts = text.split()
-        if len(parts) < 2:
-            send_tg("Usage: /whale_add <WALLET_ADDRESS>", chat_id)
-        else:
-            ok, msg2 = add_whale(parts[1])
-            send_tg(msg2, chat_id)
-        return jsonify({"ok": True})
-
-    if text.startswith("/whale_remove"):
-        parts = text.split()
-        if len(parts) < 2:
-            send_tg("Usage: /whale_remove <WALLET_ADDRESS>", chat_id)
-        else:
-            ok, msg2 = remove_whale(parts[1])
-            send_tg(msg2, chat_id)
-        return jsonify({"ok": True})
-
-    if text.startswith("/kinchi"):
-        send_tg("🔎 Cryps Ultra Scanner\nScanning latest on-chain mints & whales…", chat_id)
-        # purely cosmetic – real feed comes from Helius → /hel-webhook
-        return jsonify({"ok": True})
-
-    if text.startswith("/scan"):
-        send_tg("🛰️ Live Whale Heatmap\nCollecting signals from Helius…", chat_id)
-        # manual scan is symbolic here (no node calls) – feed=webhook
-        return jsonify({"ok": True})
-
-    if text.startswith("/winners"):
-        toks = load_tokens()
-        if not toks:
-            send_tg("🏆 Top Winner Tokens (last 24h)\n— module v1.1 coming next.", chat_id)
-        else:
-            # show up to 10
-            lines = []
-            for t in toks[:10]:
-                lines.append(f"• <b>{t.get('symbol','?')}</b>\n"
-                             f"<code>{t.get('mint')}</code>\n"
-                             f"<a href=\"{solscan_token(t['mint'])}\">Solscan</a> | "
-                             f"<a href=\"{dexscreener(t['mint'])}\">DexScreener</a>")
-            send_tg("🏆 Top Winner Tokens (24h)\n" + "\n\n".join(lines), chat_id)
-        return jsonify({"ok": True})
-
-    # fallback
-    send_tg("ℹ️ Commands: /scan /winners /kinchi /whales", chat_id)
+def ok():
     return jsonify({"ok": True})
 
-# --- Helius webhook (Enhanced), secured by header X-Cryps-Secret or ?secret=
+# -----------------------------
+# HELIUS WEBHOOK
+# -----------------------------
 @app.post("/hel-webhook")
 def hel_webhook():
-    secret = request.headers.get("X-Cryps-Secret") or request.args.get("secret")
-    if HELIUS_SEC and secret != HELIUS_SEC:
-        return jsonify({"error": "unauthorized"}), 403
+    # basic shared-secret
+    if request.args.get("secret") != HEL_SECRET:
+        abort(403)
 
-    evt = request.get_json(silent=True)
-    if not evt:
-        return jsonify({"error": "no_json"}), 400
-
-    txs = evt.get("transactions", []) if isinstance(evt, dict) else evt
-    whales = set(read_whales())
-    n_whales = 0
-    n_mints  = 0
-
-    for tx in txs:
-        try:
-            sig  = tx.get("signature") or tx.get("signature", "")
-            typ  = tx.get("type") or ""
-            sol  = float(tx.get("sol", 0.0))
-            accs = set([a.get("account") for a in tx.get("accounts", []) if a.get("account")])
-
-            # whale detection
-            if whales and any(a in whales for a in accs):
-                n_whales += 1
-                send_tg(f"🐋 <b>Whale Detected</b>\n{sol:.2f} SOL\n"
-                        f"<a href=\"{solscan_tx(sig)}\">Solscan</a>", disable_preview=True)
-                log_signal(f"WHLE sig={sig} sol={sol}")
-
-            # mint detection (best-effort):
-            # Helius enhanced often puts 'TOKEN_MINT' or has 'tokenTransfers'
-            mint = None
-            if typ == "TOKEN_MINT":
-                n_mints += 1
-                # try find mint address
-                tt = tx.get("tokenTransfers") or []
-                if tt and isinstance(tt, list):
-                    mint = tt[0].get("mint")
-            else:
-                tt = tx.get("tokenTransfers") or []
-                for t in tt:
-                    if t.get("type") == "MINT":
-                        mint = t.get("mint")
-                        n_mints += 1
-                        break
-
-            if mint:
-                # save quick entry
-                tokens = load_tokens()
-                tokens.insert(0, {"mint": mint, "symbol": tx.get("symbol","?"), "ts": now()})
-                tokens = tokens[:100]  # keep last 100
-                save_tokens(tokens)
-
-                msg = (f"⚡ <b>New Token Minted</b>\n"
-                       f"<code>{mint}</code>\n"
-                       f"<a href=\"{solscan_token(mint)}\">Solscan</a> | "
-                       f"<a href=\"{dexscreener(mint)}\">DexScreener</a>\n"
-                       f"CrypsScore: 4/10")
-                send_tg(msg, disable_preview=False)
-                log_signal(f"MINT mint={mint} sig={sig}")
-
-        except Exception as err:
-            print("ERR:", err)
-
-    # end summary
-    if (n_mints + n_whales) > 0:
-        send_tg(f"🪙 Feed: {n_mints} mints, {n_whales} whale txs", disable_preview=True)
+    payload = request.get_json(silent=True) or {}
+    # enhanced webhook usually: {"type":"...","events":[...]} or list of txns
+    events = []
+    if isinstance(payload, dict) and "events" in payload:
+        events = payload["events"] or []
+    elif isinstance(payload, list):
+        events = payload
     else:
-        # ما كنصيفطوش بزاف باش مانصرفوش الكريدي، غير واحد المرة فالأمر
-        print(f"[HEL] Feed: {n_mints} mints, {n_whales} whale txs")
+        # single event?
+        events = [payload]
 
-    return jsonify({"ok": True})
+    mints_total = 0
+    winners_sent = 0
 
+    for ev in events:
+        # Collect addresses present in the transaction
+        account_keys = []
+        if isinstance(ev, dict):
+            account_keys = list(set( (ev.get("accountData", []) or []) + (ev.get("accountKeys", []) or []) ))
+            # fallback: some payloads use "accountKeysList"
+            if not account_keys and isinstance(ev.get("accountKeysList"), list):
+                account_keys = ev["accountKeysList"]
+
+        # Collect mints from tokenTransfers
+        token_transfers = ev.get("tokenTransfers", []) if isinstance(ev, dict) else []
+        mints = set()
+        owners = set()
+        for tr in token_transfers:
+            m = tr.get("mint") or tr.get("tokenAddress")
+            if m:
+                mints.add(m)
+            if tr.get("fromUserAccount"): owners.add(tr.get("fromUserAccount"))
+            if tr.get("toUserAccount"): owners.add(tr.get("toUserAccount"))
+
+        # also capture if "mint" field exists (CREATE/MINT events)
+        base_mint = ev.get("mint") or ev.get("tokenAddress")
+        if base_mint:
+            mints.add(base_mint)
+
+        # No mint found? skip
+        if not mints:
+            continue
+
+        for mint in mints:
+            if seen_recent(mint):
+                continue
+
+            mints_total += 1
+            score, info = compute_cryps_score(mint, account_keys, owners)
+
+            # Filter: Winners only
+            if score < 9:
+                # uncomment to debug low-score feed
+                # tg_send(f"🐣 Skipped {mint}\nCrypsScore: {score}/12")
+                continue
+
+            winners_sent += 1
+
+            # Build message
+            solscan_link = SOLSCAN_MINT.format(mint)
+            ds_link = info.get("pair_url") or DEXSCREENER.format(mint)
+
+            header = "🏆 <b>Winner Token</b>"
+            ray = "yes" if info.get("raydium") else "no"
+            whale_hits = info.get("whale_hits", 0)
+            uniq = info.get("unique_wallets", 0)
+
+            parts = [
+                f"{header}",
+                f"<code>{mint}</code>",
+                f"Raydium: <b>{ray}</b> | Whales: <b>{whale_hits}</b> | Wallets: <b>{uniq}</b>",
+            ]
+
+            liq = info.get("liquidity_usd"); vol = info.get("h24_volume_usd"); tx1 = info.get("txns_h1")
+            if liq is not None or vol is not None or tx1 is not None:
+                parts.append(
+                    f"Liquidity: <b>{human_usd(liq)}</b> | 24h Vol: <b>{human_usd(vol)}</b> | 1h TXs: <b>{tx1}</b>"
+                )
+
+            parts.append(f'<a href="{solscan_link}">Solscan</a> | <a href="{ds_link}">DexScreener</a>')
+            parts.append(f"CrypsScore: <b>{score}/12</b>")
+
+            tg_send("\n".join(parts), preview=True)
+
+    return jsonify({"ok": True, "mints": mints_total, "winners": winners_sent})
+
+# -----------------------------
+# RUN (for local debug)
+# -----------------------------
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "10000"))
+    port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
