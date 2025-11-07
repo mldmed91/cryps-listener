@@ -1,432 +1,586 @@
-# app.py
+# app.py — Cryps Ultra Pilot (Accum60 Edition)
+# ------------------------------------------------------------
+# ENV vars: BOT_TOKEN, CHAT_ID, TG_SECRET, HELIUS_SECRET
+# Optional: RENDER_EXTERNAL_URL (Render auto), PORT
+# Files used if موجودين: whales.txt, mev.txt
+# ------------------------------------------------------------
+
 import os, json, time, threading
 from datetime import datetime, timedelta, timezone
-from collections import defaultdict
 from flask import Flask, request, jsonify
 import requests
 
-# =========[ ENV / CONFIG ]=========
-from dotenv import load_dotenv
-load_dotenv()
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
 
-BOT_TOKEN   = os.getenv("BOT_TOKEN", "").strip()
-CHAT_ID     = os.getenv("CHAT_ID", "").strip()
-TG_SECRET   = os.getenv("TG_SECRET", "tgsecret").strip()
-HEL_SECRET  = os.getenv("HEL_SECRET", "helsecret").strip()
+# ====== Config ======
+BOT_TOKEN     = os.getenv("BOT_TOKEN","").strip()
+CHAT_ID       = os.getenv("CHAT_ID","").strip()
+TG_SECRET     = os.getenv("TG_SECRET","").strip()   # لحماية /tg
+HEL_SECRET    = os.getenv("HELIUS_SECRET","").strip()  # لحماية /hel-webhook
+APP_URL       = os.getenv("RENDER_EXTERNAL_URL","").strip()
+PORT          = int(os.getenv("PORT","10000"))
 
-DATA_DIR = "data"
-os.makedirs(DATA_DIR, exist_ok=True)
+STATE_FILE    = "data/state.json"
+CLUSTERS_DB   = "data/clusters.json"
+LOG_FILE      = "data/signals.log"
 
-WHALES_FILE = os.path.join(DATA_DIR, "whales.txt")  # لائحة العناوين (Whales/CEX/MEV…)
-STATE_FILE  = os.path.join(DATA_DIR, "state.json")  # حالة التشغيل و الإعدادات
-CLUSTERS_DB = os.path.join(DATA_DIR, "clusters.json")  # تخزين التجميعات حسب mint
-LOG_FILE    = os.path.join(DATA_DIR, "signals.log")  # لوج للإشارات اللي تبعات
+os.makedirs("data", exist_ok=True)
 
-# =========[ GLOBAL STATE ]=========
-app = Flask(__name__)
-lock = threading.Lock()
-
-# حالة التشغيل: كيشتغل غير ملي تعطي /start فتيليجرام أو /control
+# ====== Defaults ======
 DEFAULT_STATE = {
-    "RUNNING": False,             # مايصايفط حتى تعطي الأمر
-    "COOLDOWN_SEC": 90,           # كولداون بين الرسايل فـ TG
-    "TOP_N": 10,                  # عدد ال Winners ف /winners
-    "MIN_SCORE": 70,              # حد أدنى للسكور باش يدوز
-    "WINDOW_MIN": 120,            # نافذة التحليل بالدقايق (آخر 120 دقيقة)
-    "ALLOW_AUTO_PUSH": False      # وخا RUNNING True، بقا معطّل Auto Push (تحكّم يدوي)
+    "RUNNING": False,         # ما كيخدمش حتى تعطي أمر
+    "COOLDOWN_SEC": 90,       # لتفادي السبام
+    "TOP_N": 10,              # فـ /winners
+    "MIN_SCORE": 70,          # أقل سكور باش يبان فـ /winners
+    "WINDOW_MIN": 120,        # نافذة التحليل بالـ دقائق
+    "ALLOW_AUTO_PUSH": False, # مايبعتش للتيلغرام تلقائياً
+    # Accumulation Window
+    "ACCUM_DAYS": 60,
+    "MIN_UNIQUE_DAYS": 10,    # زيدها 12..15 إذا بغيتي تشدد
+    "ACCUM_BONUS": 18         # بونيس فالسكور إذا توفّر تراكم الأيام
 }
 
-BASE_FILTER = {
-    # فلترة التوكنات الكلاسيكية باش مانخسروش الكريدي على SOL/USDC/USDT…
-    "block_mints": set([
-        "So11111111111111111111111111111111111111112",  # SOL
-        "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
-        "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",  # USDT
-        # زيد اللي بغيت بسهولة
-    ])
-}
-
-# برامج Raydium (باش نعرف LP/Initialize)
-RAYDIUM_PROGRAMS = set([
-    "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C",  # CPMM
-    "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",  # AMM v4
-    "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK",  # CLMM
-    "LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj",  # LaunchLab
+NOISE_MINTS = set([
+    # WSOL / USDC / USDT وغيرها
+    "So11111111111111111111111111111111111111112",
+    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
+    # أمثلة "pump" المزيفة
+    "zGh48JtNHVBb5evgoZLXwgPD2Qu4MhkWdJLGDAupump",
+    "HsfJnaBfRhBUTQCzCpXdL5codokZw6nwwWFnkzeWpump",
+    "22bpMFQKeETcpEUid6wLLhjWJeGgqB8uQmub5A7ppump"
 ])
 
-# =========[ HELPERS ]=========
+# Raydium Programs (Mainnet)
+RAYDIUM_PROGRAMS = set([
+    "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C",  # CPMM
+    "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",  # Legacy v4
+    "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK",  # CLMM
+    "LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj"   # LaunchLab
+])
+
+# بعض Hot wallets/CEX/Bridges/Fees (عينة):
+KNOWN_LABELS = {
+    "43DbAvKxhXh1oSxkJSqGosNw3HpBnmsWiak6tB5wpecN": "CEX.Backpack",
+    "u6PJ8DtQuPFnfmwHbGFULQ4u4EgjDiyYKjVEsynXq2w": "CEX.Gate",
+    "ASTyfSima4LLAdDgoFGkgqoKowG1LZFDr9fAQrg7iaJZ": "CEX.MEXC",
+    "A77HErqtfN1hLLpvZ9pCtu66FEtM8BveoaKbbMoZ4RiR": "CEX.Bitget",
+    "5tzFkiKscXHK5ZXCGbXZxdw7gTjjD1mBwuoFbhUvuAi9": "CEX.Binance",
+    "HLnpSz9h2S4hiLQ43rnSD9XkcUThA7B8hQMKmDaiTLcC": "Meteora.Auth",
+    "8psNvWTrdNTiVRNzAgsou9kETXNJm2SXZyaKuJraVRtf": "Phantom.Fees",
+    "j1oxqtEHFn7rUkdABJLmtVtz5fFmHFs4tCG3fWJnkHX": "Jupiter",
+    "j1oAbxxiDUWvoHxEDhWE7THLjEkDQW2cSHYn2vttxTF": "Jupiter.Limit",
+    "HV1KXxWFaSeriyFvXyx48FqG9BoFbfinB8njCJonqP7K": "OKX.DEX.Router",
+    "ZG98FUCjb8mJ824Gbs6RsgVmr1FhXb2oNiJHa2dwmPd": "BONKbot.Fees",
+    "F7p3dFrjRTbtRp8FRF6qHLomXbKRBzpvBLjtQcfcgmNe": "Relay.Solver",
+    "GpMZbSM2GgvTKHJirzeGfMFoaZ8UR2X7F4v8vHTvxFbL": "Raydium.Vault",
+    "45ruCyfdRkWpRNGEqWzjCiXRHkZs8WXCLQ67Pnpye7Hp": "Jupiter.RefVault",
+    "25mYnjJ2MXHZH6NvTTdA63JvjgRVcuiaj6MRiEQNs1Dq": "Phantom.SwapFees",
+    "j1oeQoPeuEDmjvyMwBmCWexzCQup77kbKKxV59CnYbd": "Jupiter.Limit2",
+    "2snHHreXbpJ7UwZxPe37gnUNf7Wx7wv6UKDSR2JckKuS": "deBridge.Bridge"
+}
+
+# ====== Globals ======
+lock = threading.Lock()
+
 def _now():
     return datetime.now(timezone.utc)
 
 def load_state():
     if not os.path.exists(STATE_FILE):
-        save_state(DEFAULT_STATE)
-        return DEFAULT_STATE.copy()
-    with open(STATE_FILE, "r") as f:
-        try:
-            data = json.load(f)
-        except:
-            data = {}
-    # merge defaults for any missing keys
-    final = DEFAULT_STATE.copy()
-    final.update(data)
-    return final
+        save_state(DEFAULT_STATE.copy())
+    try:
+        with open(STATE_FILE,"r") as f:
+            st = json.load(f)
+    except Exception:
+        st = DEFAULT_STATE.copy()
+    # ensure defaults exist
+    for k,v in DEFAULT_STATE.items():
+        if k not in st:
+            st[k]=v
+    return st
 
 def save_state(st):
-    with open(STATE_FILE, "w") as f:
+    with open(STATE_FILE,"w") as f:
         json.dump(st, f, indent=2)
-
-def load_whales():
-    # كيقرأ جميع العناوين من whales.txt (كل سطر عنوان)
-    if not os.path.exists(WHALES_FILE):
-        with open(WHALES_FILE, "w") as f:
-            f.write("")
-        return set()
-    items = set()
-    with open(WHALES_FILE, "r") as f:
-        for line in f:
-            a = line.strip()
-            if len(a) > 30:
-                items.add(a)
-    return items
 
 def load_clusters():
     if not os.path.exists(CLUSTERS_DB):
-        with open(CLUSTERS_DB, "w") as f:
+        with open(CLUSTERS_DB,"w") as f:
             json.dump({}, f)
         return {}
-    with open(CLUSTERS_DB, "r") as f:
-        try:
+    try:
+        with open(CLUSTERS_DB,"r") as f:
             db = json.load(f)
-        except:
-            db = {}
+    except Exception:
+        db = {}
+    # restore sets
+    for m,e in db.items():
+        if isinstance(e.get("touchers"), list):
+            e["touchers"] = set(e["touchers"])
+        if isinstance(e.get("unique_days"), list):
+            e["unique_days"] = set(e["unique_days"])
     return db
 
 def save_clusters(db):
+    serializable = {}
+    for m,e in db.items():
+        ee = dict(e)
+        if isinstance(ee.get("touchers"), set):
+            ee["touchers"] = list(ee["touchers"])
+        if isinstance(ee.get("unique_days"), set):
+            ee["unique_days"] = list(ee["unique_days"])
+        serializable[m] = ee
     with open(CLUSTERS_DB, "w") as f:
-        json.dump(db, f, indent=2)
+        json.dump(serializable, f, indent=2)
 
-def log_line(line):
-    with open(LOG_FILE, "a") as log:
-        log.write(f"{_now().isoformat()}  {line}\n")
-
-def tg_send(text, disable_preview=True):
-    if not BOT_TOKEN or not CHAT_ID:
-        return
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": CHAT_ID,
-        "text": text,
-        "disable_web_page_preview": disable_preview,
-        "parse_mode": "Markdown"
-    }
+def log_line(s):
     try:
-        requests.post(url, json=payload, timeout=8)
-    except Exception as e:
-        log_line(f"[TG_ERR] {e}")
+        with open(LOG_FILE,"a",encoding="utf-8") as log:
+            log.write(f"[{_now().isoformat()}] {s}\n")
+    except Exception:
+        pass
 
-def is_noise_mint(mint):
-    return mint in BASE_FILTER["block_mints"]
+# ====== Files: whales.txt / mev.txt ======
+def read_lines(fname):
+    out = []
+    if not os.path.exists(fname): return out
+    with open(fname,"r",encoding="utf-8", errors="ignore") as f:
+        for ln in f.read().splitlines():
+            ln = ln.strip()
+            if not ln or ln.startswith("#"): continue
+            out.append(ln)
+    return out
 
-def short(addr):
-    if len(addr) < 8: return addr
-    return f"{addr[:6]}…{addr[-4:]}"
+def load_watchlists():
+    whales = set(read_lines("whales.txt"))
+    mev    = set(read_lines("mev.txt"))
+    return whales, mev
 
-# =========[ SCORING ]=========
-def score_entry(e):
-    """
-    e: {
-      "mint": str,
-      "first_seen": iso,
-      "last_seen": iso,
-      "counts": {"whale":int, "cex":int, "mev":int, "bridges":int},
-      "lp_init": bool
-    }
-    """
-    c = e.get("counts", {})
-    w = c.get("whale", 0)
-    cx = c.get("cex", 0)
-    mv = c.get("mev", 0)
-    br = c.get("bridges", 0)
-    lp = 1 if e.get("lp_init") else 0
+# ====== Helpers ======
+def is_noise_mint(mint:str)->bool:
+    if mint in NOISE_MINTS: return True
+    if len(mint)<20: return True
+    return False
 
-    # وزن مخصص للميمات القابلة للانفجار قبل ما تطلع بزاف
-    # (Whales + MEV + Bridges قبل LP) = أقوى سيگنال
-    base = (w * 12) + (mv * 10) + (br * 14) + (cx * 6) + (lp * 8)
-
-    # decay بسيط مع الوقت: إشارات قديمة تنقص قيمتها
-    try:
-        last = datetime.fromisoformat(e["last_seen"])
-    except:
-        last = _now()
-    age_min = max(0, (_now() - last).total_seconds() / 60.0)
-    decay = max(0.6, 1.0 - (age_min / 240.0))  # ينقص تدريجياً حتى 0.6 خلال ~4 ساعات
-
-    score = int(min(100, base * decay))
-    return score
-
-# =========[ CLUSTER LOGIC ]=========
 def _ensure_entry(db, mint):
     if mint not in db:
         db[mint] = {
             "mint": mint,
             "first_seen": _now().isoformat(),
             "last_seen": _now().isoformat(),
-            "counts": {"whale": 0, "cex": 0, "mev": 0, "bridges": 0},
+            "counts": {"whale":0, "cex":0, "mev":0, "bridges":0},
             "lp_init": False,
-            "touchers": set(),  # سنحوّلها ل list عند الحفظ
+            "touchers": set(),
+            "unique_days": set()
         }
     return db[mint]
 
-def _classify_addr(addr, whales_set):
-    # التصنيف غادي يكون بسيط: بما أن whales.txt فيه خليط (CEX/MEV/Whales/Bridges)
-    # نسمّيه "whale" by default، ونديرو تمييز سطحي حسب patterns:
-    a = addr
-    # لو بغيت تزيد قواعد: prefix/labels… من Arkham/نيمّنغ
-    if a in whales_set:
-        # مؤشرات بسيطة:
-        if a.lower().startswith(("a77h","ast","u6pj","5tzfk","43db")):
-            return "cex"
-        return "whale"
-    return "other"
+def _maybe_bridge_label(addr:str)->bool:
+    # أي عنوان معروف من KNOWN_LABELS فيه CEX أو Bridge يعتبر bridge/cex touch
+    label = KNOWN_LABELS.get(addr, "")
+    if not label: return False
+    return ("CEX." in label) or ("Bridge" in label)
 
-def _maybe_bridge_label(addr):
-    # تقديرية: بعض العناوين ديال bridge اللي نعرفوها (مثال deBridge…)
-    # زيد عليهم اللي عندك مع الوقت
-    known_bridges = [
-        "2snHHreXbpJ7UwZxPe37gnUNf7Wx7wv6UKDSR2JckKuS",  # deBridge
-    ]
-    return addr in known_bridges
+def raydium_prog_hit(prog:str)->bool:
+    return prog in RAYDIUM_PROGRAMS
 
-def register_event(db, mint, touch_addrs, ray_prog_hit=False):
+def age_minutes(iso_ts):
+    try:
+        dt = datetime.fromisoformat(iso_ts)
+    except Exception:
+        return 0
+    return max(0, (_now()-dt).total_seconds()/60.0)
+
+def whatsapp_round(x):  # just nicer int clamp
+    try:
+        return int(round(float(x)))
+    except: 
+        return 0
+
+# ====== Scoring (with Accum60) ======
+def score_entry(e):
+    c = e.get("counts", {})
+    w  = c.get("whale", 0)
+    cx = c.get("cex",   0)
+    mv = c.get("mev",   0)
+    br = c.get("bridges",0)
+    lp = 1 if e.get("lp_init") else 0
+
+    base = (w*12) + (mv*10) + (br*14) + (cx*6) + (lp*8)
+
+    try:
+        last = datetime.fromisoformat(e["last_seen"])
+    except:
+        last = _now()
+    dec = max(0.6, 1.0 - (age_minutes(last.isoformat())/240.0))
+    score = base * dec
+
+    st = load_state()
+    acc_days   = st.get("ACCUM_DAYS",60)
+    min_unique = st.get("MIN_UNIQUE_DAYS",10)
+    bonus      = st.get("ACCUM_BONUS",18)
+
+    uds = e.get("unique_days", set()) or set()
+    cutoff = (_now() - timedelta(days=acc_days)).date()
+    recent = [d for d in uds if datetime.fromisoformat(d).date() >= cutoff]
+    if len(recent) >= min_unique:
+        score += bonus
+
+    return int(min(100, round(score)))
+
+def format_signal(e, score:int):
+    mint = e["mint"]
+    scan = f"Solscan (https://solscan.io/token/{mint})"
+    dskr = f"DexScreener (https://dexscreener.com/solana/{mint})"
+    # basic label of whales in touchers
+    touchers = list(e.get("touchers", []))
+    wl = []
+    whales, mev = load_watchlists()
+    for a in touchers[:6]:
+        tag = "#"
+        if a in whales: tag = "W"
+        if a in mev:    tag = "M"
+        short = f"{a[:6]}…{a[-5:]}[{tag}]"
+        wl.append(short)
+    wl_str = ", ".join(wl) if wl else "—"
+
+    return (
+        f"⚡ *CANDIDATE*  •  CrypsScore: *{score}/100*\n"
+        f"`{mint}`\n{scan} | {dskr}\n"
+        f"👥 Touchers: {wl_str}"
+    )
+
+# ====== Register Events ======
+def register_event(db, mint, touch_addrs, ray_prog_hit=False, is_mev=False, is_cex=False):
     e = _ensure_entry(db, mint)
     e["last_seen"] = _now().isoformat()
-    whales = load_whales()
-
-    # صنّف اللمسات:
-    w,cx,mv,br = 0,0,0,0
-    for a in touch_addrs:
-        t = _classify_addr(a, whales)
-        if t == "whale": w += 1
-        if t == "cex":   cx += 1
-        # MEV: تقدير — ممكن تدير لائحة MEV منفصلة وتفرّق بوضوح
-        if a in whales and a.lower() not in ("a77h","ast","u6pj","5tzfk","43db"):
-            # نعتبر اللي ماطلعش CEX غالباً MEV/Smart
-            mv += 1
-        if _maybe_bridge_label(a): br += 1
-
-        e["touchers"].add(a)
-
-    e["counts"]["whale"]  += w
-    e["counts"]["cex"]    += cx
-    e["counts"]["mev"]    += mv
-    e["counts"]["bridges"]+= br
+    # unique day
+    e["unique_days"].add(_now().strftime("%Y-%m-%d"))
+    # counters
+    if is_mev:
+        e["counts"]["mev"] += 1
+    if is_cex:
+        e["counts"]["cex"] += 1
+        e["counts"]["bridges"] += 1  # نعطيها bridge touch لأن المصدر CEX/Bridge
     if ray_prog_hit:
         e["lp_init"] = True
+    # touchers
+    for a in (touch_addrs or []):
+        e["touchers"].add(a)
+        # heuristics: إذا العنوان معروف CEX/Bridge زيد bridges
+        if _maybe_bridge_label(a):
+            e["counts"]["bridges"] += 1
 
-def purge_old(db, window_min):
-    # مسح التجميعات لّي مرّات عليها مدة كبيرة
-    cutoff = _now() - timedelta(minutes=window_min)
-    to_del = []
-    for mint, e in db.items():
+# ====== Winners ======
+def compute_winners():
+    st = load_state()
+    db = load_clusters()
+    min_score = int(st.get("MIN_SCORE",70))
+    topn      = int(st.get("TOP_N",10))
+    window    = int(st.get("WINDOW_MIN",120))
+    cutoff    = _now() - timedelta(minutes=window)
+
+    bucket = []
+    for m,e in db.items():
+        if is_noise_mint(m): 
+            continue
         try:
             last = datetime.fromisoformat(e["last_seen"])
         except:
             last = _now()
         if last < cutoff:
-            to_del.append(mint)
-    for mint in to_del:
-        del db[mint]
+            continue
+        s = score_entry(e)
+        if s >= min_score:
+            bucket.append((s, m, e))
 
-def render_line(mint, e, s):
-    c = e.get("counts", {})
-    w = c.get("whale", 0); cx = c.get("cex",0); mv = c.get("mev",0); br = c.get("bridges",0)
-    lp = "✅" if e.get("lp_init") else "⏳"
-    return (
-        f"*{mint}* • CrypsScore: *{s}/100* {lp}\n"
-        f"🐋 Whales:{w}  🏦 CEX:{cx}  🤖 MEV:{mv}  🌉 Bridges:{br}\n"
-        f"[Solscan](https://solscan.io/token/{mint}) | [Dexscreener](https://dexscreener.com/solana/{mint})\n"
-    )
+    bucket.sort(key=lambda x: x[0], reverse=True)
+    return bucket[:topn]
 
-# =========[ TELEGRAM WEBHOOK ]=========
-@app.route(f"/tg/{TG_SECRET}", methods=["POST"])
-def tg_webhook():
-    data = request.get_json(force=True, silent=True) or {}
+def winners_message():
+    wins = compute_winners()
+    if not wins:
+        return "لا يوجد Winners فهاذ النافذة (جرّب تزير الشروط أو وسّع WINDOW_MIN)."
+    lines = ["🏆 *Top Winners*"]
+    rank=1
+    for s,m,e in wins:
+        uds = len(e.get("unique_days",set()))
+        lines.append(f"{rank}. `{m}`  — *{s}/100*  (days:{uds})")
+        rank+=1
+    return "\n".join(lines)
+
+# ====== Telegram ======
+def tg_send(text, md=False):
+    if not BOT_TOKEN or not CHAT_ID: return
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": CHAT_ID,
+        "text": text
+    }
+    if md:
+        payload["parse_mode"]="Markdown"
+        payload["disable_web_page_preview"]=True
     try:
-        msg = data.get("message") or data.get("edited_message") or {}
-        chat_id = str(msg.get("chat", {}).get("id", ""))
-        text = (msg.get("text") or "").strip()
-    except Exception:
-        return jsonify({"ok": True})
+        requests.post(url, json=payload, timeout=10)
+    except Exception as ex:
+        log_line(f"TG send err: {ex}")
 
-    # ماكنجاوب إلا إلى كان هاد الشات هو ديالنا
-    if CHAT_ID and chat_id and CHAT_ID != chat_id:
-        return jsonify({"ok": True})
+# ====== Flask ======
+app = Flask(__name__)
 
-    if text.lower().startswith("/start"):
+@app.route("/")
+def index():
+    return jsonify({"ok":True, "app":"Cryps Ultra Pilot — Accum60", "running": load_state().get("RUNNING")})
+
+# Telegram webhook (اختياري، تقدّر تستعمل getUpdates)
+@app.route("/tg", methods=["POST"])
+def tg_webhook():
+    if TG_SECRET and request.headers.get("X-TG-Secret","") != TG_SECRET:
+        return jsonify({"ok":False, "err":"bad secret"}), 401
+
+    data = request.json or {}
+    msg = data.get("message", {})
+    text = (msg.get("text","") or "").strip()
+    if not text: 
+        return jsonify({"ok":True})
+
+    with lock:
         st = load_state()
-        st["RUNNING"] = True
-        save_state(st)
-        tg_send("🟢 *Cryps Ultra Pilot:* شغال دابا.\n\nأوامر مفيدة:\n/winners — يعرض Top 10\n/stop — يوقّف الدفع التلقائي\n/qa <mint> — فحص سريع", True)
 
-    elif text.lower().startswith("/stop"):
-        st = load_state()
-        st["RUNNING"] = False
-        st["ALLOW_AUTO_PUSH"] = False
-        save_state(st)
-        tg_send("🛑 توقّف. ما غاديش نصايفط حتى تعطي أمر.", True)
+        # /help
+        if text.lower() in ("/help","help"):
+            help_msg = (
+                "*Commands*\n"
+                "/start — تشغيل التتبع (ماكاينش auto push).\n"
+                "/stop — إيقاف كامل.\n"
+                "/winners — أعلى 10 بمقاييسك.\n"
+                "/history <mint> — تاريخ الأيام الفريدة وسكور.\n"
+                "/control key=val — تحديث إعدادات (MIN_SCORE,TOP_N,WINDOW_MIN,COOLDOWN_SEC,ACCUM_DAYS,MIN_UNIQUE_DAYS,ACCUM_BONUS).\n"
+                "/add_whale <addr> — زيد عنوان للائحة الحيتان (محلياً).\n"
+            )
+            tg_send(help_msg, True)
+            return jsonify({"ok":True})
 
-    elif text.lower().startswith("/winners"):
-        # عرض Top N بناءً على آخر WINDOW_MIN دقيقة
-        st = load_state()
-        db = load_clusters()
-        window = st["WINDOW_MIN"]
-        purge_old(db, window)
+        # /start
+        if text.lower() == "/start":
+            st["RUNNING"]=True
+            save_state(st)
+            tg_send("✅ *RUNNING = True* — غادي نخزّن الإشارات فقط. استعمل /winners باش تشوف الترتيب.", True)
+            return jsonify({"ok":True})
 
-        # حوّل touchers من set → list قبل التقييم
-        for e in db.values():
-            if isinstance(e.get("touchers"), set):
-                e["touchers"] = list(e["touchers"])
+        # /stop
+        if text.lower() == "/stop":
+            st["RUNNING"]=False
+            save_state(st)
+            tg_send("⛔ *RUNNING = False* — تمّ التوقيف. ماكاع نبعث حتى حاجة حتى تعاود تشغّل.", True)
+            return jsonify({"ok":True})
 
-        scored = []
-        for mint, e in db.items():
-            if is_noise_mint(mint):
-                continue
-            s = score_entry(e)
-            if s >= st["MIN_SCORE"]:
-                scored.append((s, mint, e))
-        scored.sort(reverse=True, key=lambda x: x[0])
+        # /winners
+        if text.lower() == "/winners":
+            tg_send(winners_message(), True)
+            return jsonify({"ok":True})
 
-        if not scored:
-            tg_send("⏳ ما كاين حتى Winner فـ النافذة ديال الوقت الحالية. جرّب من بعد دقائق.", True)
-        else:
-            topn = st["TOP_N"]
-            out = ["*🏆 Top Winners (last {}m)*".format(window)]
-            for i, (s, mint, e) in enumerate(scored[:topn], start=1):
-                out.append(f"{i}. " + render_line(mint, e, s))
-            tg_send("\n".join(out), False)
-
-    elif text.lower().startswith("/qa"):
-        parts = text.split()
-        if len(parts) < 2:
-            tg_send("استعمال: `/qa <mint>`", True)
-        else:
-            mint = parts[1].strip()
-            db = load_clusters()
-            e = db.get(mint)
-            if not e:
-                tg_send("ما لقيتش بيانات على هاد المينت فقاعدة التجميعات.", True)
+        # /history <mint>
+        if text.lower().startswith("/history"):
+            parts = text.split()
+            if len(parts)<2:
+                tg_send("استعمال: `/history <mint>`", True)
             else:
-                s = score_entry(e)
-                line = render_line(mint, e, s)
-                tg_send("🔎 *QA Quick Check*\n" + line, False)
+                mint = parts[1].strip()
+                db = load_clusters()
+                e  = db.get(mint)
+                if not e:
+                    tg_send("ما لقيتش هاد المينت فقاعدة البيانات.", True)
+                else:
+                    uds = e.get("unique_days", set()) or set()
+                    days_list = sorted(list(uds))
+                    first_seen = e.get("first_seen","-")
+                    last_seen  = e.get("last_seen","-")
+                    st = load_state()
+                    cutoff = (_now() - timedelta(days=st.get("ACCUM_DAYS",60))).date()
+                    recent_count = sum(1 for d in days_list if datetime.fromisoformat(d).date() >= cutoff)
+                    s = score_entry(e)
+                    msg = (
+                        f"🗓 *Accumulation History*\n"
+                        f"Mint: `{mint}`\n"
+                        f"Unique days (total): *{len(days_list)}*\n"
+                        f"Unique days (last {st.get('ACCUM_DAYS',60)}d): *{recent_count}*\n"
+                        f"First seen: `{first_seen}`\n"
+                        f"Last seen:  `{last_seen}`\n"
+                        f"CrypsScore (now): *{s}/100*"
+                    )
+                    tg_send(msg, True)
+            return jsonify({"ok":True})
 
-    else:
-        tg_send("أوامر: /start /stop /winners /qa <mint>", True)
+        # /control key=val
+        if text.lower().startswith("/control"):
+            try:
+                pairs = text.split()[1:]
+                upd = {}
+                for p in pairs:
+                    if "=" not in p: continue
+                    k,v = p.split("=",1)
+                    k=k.strip().upper()
+                    v=v.strip()
+                    if k in ("RUNNING","ALLOW_AUTO_PUSH"):
+                        upd[k] = (v.lower() in ("1","true","yes","on"))
+                    elif k in ("COOLDOWN_SEC","TOP_N","MIN_SCORE","WINDOW_MIN","ACCUM_DAYS","MIN_UNIQUE_DAYS","ACCUM_BONUS"):
+                        upd[k] = int(v)
+                st.update(upd)
+                save_state(st)
+                tg_send(f"تمّ التحديث:\n`{json.dumps(upd, indent=2)}`", True)
+            except Exception as ex:
+                tg_send(f"خطأ فـ /control: {ex}", True)
+            return jsonify({"ok":True})
 
-    return jsonify({"ok": True})
+        # /add_whale <addr>
+        if text.lower().startswith("/add_whale"):
+            parts = text.split()
+            if len(parts)<2:
+                tg_send("استعمال: `/add_whale <address>`", True)
+            else:
+                addr = parts[1].strip()
+                # append to whales.txt
+                with open("whales.txt","a") as f:
+                    f.write(addr+"\n")
+                tg_send(f"✅ تزاد للحيتان: `{addr}`", True)
+            return jsonify({"ok":True})
 
-# =========[ HELIUS WEBHOOK ]=========
-@app.route("/hel-webhook", methods=["POST"])
-def hel_webhook():
-    # تأمين الهيدر
-    sec = request.headers.get("X-Cryps-Secret", "")
+        # else:
+        tg_send("أمر غير معروف. جرّب /help", False)
+        return jsonify({"ok":True})
+
+# ====== Import CSV (Backfill 60d history) ======
+@app.route("/import_csv", methods=["POST"])
+def import_csv():
+    sec = request.headers.get("X-Cryps-Secret","")
     if HEL_SECRET and sec != HEL_SECRET:
         return jsonify({"ok": False, "err": "bad secret"}), 401
+    if "file" not in request.files:
+        return jsonify({"ok": False, "err": "no file"}), 400
 
-    payload = request.get_json(force=True, silent=True) or {}
-    # Helius ممكن يرسل single أو batch events
-    events = payload if isinstance(payload, list) else [payload]
+    f = request.files["file"]
+    lines = f.read().decode("utf-8", errors="ignore").splitlines()
+    headers = [h.strip().lower() for h in lines[0].split(",")]
+    def idx(col):
+        try: return headers.index(col)
+        except: return -1
 
-    st = load_state()
+    i_mint = idx("mint")
+    i_ts   = idx("timestamp")
+    i_addr = idx("address")
+    if min(i_mint, i_ts, i_addr) < 0:
+        return jsonify({"ok": False, "err": "missing columns mint,timestamp,address"}), 400
+
     with lock:
         db = load_clusters()
-
-        for ev in events:
-            # هيكّل الحدث و استخرج المينتات و العناوين الملامسة
-            mint_candidates = set()
-            touch_addrs = set()
-            ray_prog_hit = False
-
-            # 1) من accountData و tokenTransfers و instructions
-            accounts = ev.get("accountData") or []
-            for a in accounts:
-                addr = a.get("account", "")
-                if addr:
-                    touch_addrs.add(addr)
-
-            # token transfers:
-            tts = ev.get("tokenTransfers") or []
-            for t in tts:
-                mi = t.get("mint")
-                if mi: mint_candidates.add(mi)
-                src = t.get("fromUserAccount", "")
-                dst = t.get("toUserAccount", "")
-                for a in (src, dst):
-                    if a: touch_addrs.add(a)
-
-            # instructions/programs
-            insts = ev.get("instructions") or []
-            for ins in insts:
-                prog = ins.get("programId", "")
-                if prog:
-                    touch_addrs.add(prog)
-                    if prog in RAYDIUM_PROGRAMS:
-                        ray_prog_hit = True
-                # بعض الهيكالات عندها inner instructions
-                for sub in ins.get("innerInstructions", []) or []:
-                    sp = sub.get("programId", "")
-                    if sp:
-                        touch_addrs.add(sp)
-                        if sp in RAYDIUM_PROGRAMS:
-                            ray_prog_hit = True
-
-            # 2) فلترة المينتات الكلاسيكية
-            mints = [m for m in mint_candidates if not is_noise_mint(m)]
-            if not mints:
+        cnt=0
+        for row in lines[1:]:
+            parts = row.split(",")
+            if len(parts)<len(headers): continue
+            mint = parts[i_mint].strip()
+            if not mint or is_noise_mint(mint): 
                 continue
+            ts   = parts[i_ts].strip().replace("Z","+00:00")
+            addr = parts[i_addr].strip()
 
-            # 3) سجّل لكل مينت
-            for mint in mints:
-                register_event(db, mint, touch_addrs, ray_prog_hit=ray_prog_hit)
-
-        # تنظيف قديم
-        purge_old(db, load_state()["WINDOW_MIN"])
-
-        # حفظ touchers ك list (JSON-safe)
-        for e in db.values():
-            if isinstance(e.get("touchers"), set):
-                e["touchers"] = list(e["touchers"])
+            e = _ensure_entry(db, mint)
+            e["last_seen"] = ts
+            try:
+                day_key = datetime.fromisoformat(ts).strftime("%Y-%m-%d")
+            except:
+                day_key = _now().strftime("%Y-%m-%d")
+            e["unique_days"].add(day_key)
+            if addr:
+                e["touchers"].add(addr)
+            cnt+=1
 
         save_clusters(db)
 
-    # ماكنبعت والو تلقائياً إلا إذا فعلتها يدويّاً، باش مانضيّعوش الكريدي
-    return jsonify({"ok": True})
+    return jsonify({"ok":True, "imported_rows": cnt})
 
-# =========[ CONTROL (اختياري) ]=========
-@app.route("/control", methods=["POST"])
-def control():
-    """
-    نقطة تحكّم بسيطة (اختيارية) لو بغيت تغيّر إعدادات بلا Telegram.
-    JSON:
-    { "RUNNING": true/false, "ALLOW_AUTO_PUSH": true/false, "MIN_SCORE": 75, "TOP_N": 10, "WINDOW_MIN": 120 }
-    """
-    sec = request.headers.get("X-Cryps-Secret", "")
-    if HEL_SECRET and sec != HEL_SECRET:
-        return jsonify({"ok": False, "err": "bad secret"}), 401
-    st = load_state()
-    body = request.get_json(force=True, silent=True) or {}
-    for k,v in body.items():
-        if k in DEFAULT_STATE:
-            st[k] = v
-    save_state(st)
-    return jsonify({"ok": True, "state": st})
+# ====== Helius Webhook ======
+@app.route("/hel-webhook", methods=["POST"])
+def hel_webhook():
+    # أمن
+    if HEL_SECRET and request.headers.get("X-Cryps-Secret","") != HEL_SECRET:
+        return jsonify({"ok":False, "err":"bad secret"}), 401
 
-@app.route("/health", methods=["GET"])
-def health():
-    st = load_state()
-    return jsonify({"ok": True, "state": st})
+    with lock:
+        st = load_state()
+        if not st.get("RUNNING", False):
+            # نخزن فقط، ما كنرسلش للتيلغرام
+            pass
 
+        payload = request.json or []
+        if isinstance(payload, dict):
+            payload = [payload]
+
+        db = load_clusters()
+        whales, mev = load_watchlists()
+
+        for ev in payload:
+            # Helius Enhanced webhook structure (تبسيط)
+            # نحاولو نستخرجو mint/program/ addresses
+            try:
+                accs = set()
+                mint = None
+                program = None
+                # حسب نوع الحدث
+                if "accountData" in ev:  # بعض صيغ
+                    for a in ev.get("accountData", []):
+                        accs.add(a.get("account",""))
+                if "transactions" in ev:
+                    for t in ev["transactions"]:
+                        for a in t.get("accountData",[]):
+                            accs.add(a.get("account",""))
+                        program = t.get("programId","") or program
+                        mint = t.get("tokenTransfers",[{}])[0].get("mint") or mint
+                # بدائل عامة
+                if not mint:
+                    mint = ev.get("mint") or ev.get("token") or ev.get("tokenAddress")
+                if not program:
+                    program = ev.get("programId") or ev.get("source","")
+
+                if not mint or is_noise_mint(mint):
+                    continue
+
+                # تصنيفات
+                addrs = list(accs)[:12]
+                is_mev = any(a in mev for a in addrs)
+                touch_is_cex = any(_maybe_bridge_label(a) for a in addrs)
+                prog_hit = raydium_prog_hit(program)
+
+                register_event(db, mint, addrs, ray_prog_hit=prog_hit, is_mev=is_mev, is_cex=touch_is_cex)
+
+                # بناء رسالة فقط إن ALLOW_AUTO_PUSH True
+                if st.get("ALLOW_AUTO_PUSH", False):
+                    e = db.get(mint)
+                    s = score_entry(e)
+                    if s >= st.get("MIN_SCORE",70):
+                        tg_send(format_signal(e, s), True)
+
+            except Exception as ex:
+                log_line(f"webhook err: {ex}")
+                continue
+
+        save_clusters(db)
+
+    return jsonify({"ok":True})
+
+# ====== Run ======
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "8000"))
-    app.run(host="0.0.0.0", port=port)
+    # Tip: set Telegram webhook once (اختياري)
+    # إذا بغيت polling، ماتحتاجش webhook.
+    if APP_URL and BOT_TOKEN and TG_SECRET:
+        try:
+            url = f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook"
+            requests.post(url, json={"url": f"{APP_URL}/tg", "allowed_updates":["message"]}, timeout=5)
+        except Exception:
+            pass
+    app.run(host="0.0.0.0", port=PORT)
