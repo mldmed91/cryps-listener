@@ -39,9 +39,9 @@ DEFAULT_STATE = {
     "WINDOW_MIN": 120,        # نافذة التحليل بالـ دقائق
     "ALLOW_AUTO_PUSH": False, # مايبعتش للتيلغرام تلقائياً
     # Accumulation Window
-    "ACCUM_DAYS": 60,
-    "MIN_UNIQUE_DAYS": 10,    # زيدها 12..15 إذا بغيتي تشدد
-    "ACCUM_BONUS": 18         # بونيس فالسكور إذا توفّر تراكم الأيام
+    "ACCUM_DAYS": 2,
+    "MIN_UNIQUE_DAYS": 2,    # زيدها 12..15 إذا بغيتي تشدد
+    "ACCUM_BONUS": 2         # بونيس فالسكور إذا توفّر تراكم الأيام
 }
 
 NOISE_MINTS = set([
